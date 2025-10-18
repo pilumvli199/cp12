@@ -24,10 +24,10 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 try:
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
     redis_client.ping()
-    print("✓ Redis connected")
+    print("Redis connected")
 except:
     redis_client = None
-    print("⚠ Redis not available")
+    print("Redis not available")
 
 @dataclass
 class TradingSignal:
@@ -39,7 +39,6 @@ class TradingSignal:
     tp2: Optional[float] = None
     reason: str = ""
     python_score: float = 0
-    ai_score: float = 0
     ai_analysis: Optional[Dict] = None
 
 class DeribitDataFetcher:
@@ -97,12 +96,13 @@ class DeribitDataFetcher:
                 
                 data = await resp.json()
                 
+                # Debug output
                 if 'error' in data:
                     print(f"API Error: {data['error']}")
                     return pd.DataFrame()
                 
                 if 'result' not in data:
-                    print(f"No result in response")
+                    print(f"No result in response: {data}")
                     return pd.DataFrame()
                 
                 result = data['result']
@@ -111,6 +111,7 @@ class DeribitDataFetcher:
                     print(f"Status not OK: {result.get('status')}")
                     return pd.DataFrame()
                 
+                # Check if we have data
                 if not result.get('ticks') or len(result['ticks']) == 0:
                     print(f"No ticks in response")
                     return pd.DataFrame()
@@ -146,6 +147,7 @@ class DeribitDataFetcher:
                 params={"instrument_name": instrument}
             ) as resp:
                 if resp.status != 200:
+                    print(f"OI fetch failed: status {resp.status}")
                     return {'open_interest': 0, 'volume_usd': 0, 'last_price': 0, 'funding_rate': 0}
                 
                 data = await resp.json()
@@ -207,52 +209,11 @@ class TechnicalAnalyzer:
             if len(df) >= 200:
                 df['ema_200'] = ta.trend.EMAIndicator(df['close'], window=200).ema_indicator()
             
-            # Bollinger Bands
-            bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-            df['bb_high'] = bb.bollinger_hband()
-            df['bb_mid'] = bb.bollinger_mavg()
-            df['bb_low'] = bb.bollinger_lband()
-            
-            # Volume indicators
-            df['volume_sma'] = df['volume'].rolling(window=20).mean()
-            
             print(f"✓ Indicators calculated")
         except Exception as e:
             print(f"Indicator calculation error: {e}")
         
         return df
-    
-    @staticmethod
-    def get_pattern_analysis(df):
-        """Detect candlestick patterns and market structure"""
-        try:
-            last_5 = df.tail(5)
-            patterns = []
-            
-            # Price action analysis
-            recent_high = df.tail(20)['high'].max()
-            recent_low = df.tail(20)['low'].min()
-            current_price = df['close'].iloc[-1]
-            
-            # Volume analysis
-            avg_volume = df['volume'].tail(20).mean()
-            current_volume = df['volume'].iloc[-1]
-            volume_spike = current_volume > (avg_volume * 1.5)
-            
-            # Momentum
-            price_change_5 = ((df['close'].iloc[-1] / df['close'].iloc[-5]) - 1) * 100
-            
-            return {
-                'recent_high': float(recent_high),
-                'recent_low': float(recent_low),
-                'price_position': float((current_price - recent_low) / (recent_high - recent_low) * 100),
-                'volume_spike': volume_spike,
-                'volume_ratio': float(current_volume / avg_volume),
-                'momentum_5candles': float(price_change_5),
-                'consolidating': abs(price_change_5) < 1
-            }
-        except:
-            return {}
 
 class MarketAnalyzer:
     def __init__(self):
@@ -267,19 +228,25 @@ class MarketAnalyzer:
             print(f"Analyzing {coin}")
             print(f"{'='*50}")
             
-            # Fetch with delays
+            # Fetch with delays - Use only supported resolutions
+            # Deribit supports: 1, 3, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1D
             df_15m = await self.fetcher.get_candlestick_data(instrument, "15", 500)
             await asyncio.sleep(1)
             
             df_1h = await self.fetcher.get_candlestick_data(instrument, "60", 300)
             await asyncio.sleep(1)
             
+            # Use 180 (3 hours) instead of 240 (4 hours) which is unsupported
             df_3h = await self.fetcher.get_candlestick_data(instrument, "180", 200)
             await asyncio.sleep(1)
             
             # Check if we got data
-            if df_15m.empty or df_1h.empty or df_3h.empty:
-                raise Exception(f"Missing data for {instrument}")
+            if df_15m.empty:
+                raise Exception(f"No 15m data for {instrument}")
+            if df_1h.empty:
+                raise Exception(f"No 1h data for {instrument}")
+            if df_3h.empty:
+                raise Exception(f"No 3h data for {instrument}")
             
             print(f"✓ All timeframes loaded")
             
@@ -292,37 +259,24 @@ class MarketAnalyzer:
             df_1h = TechnicalAnalyzer.calculate_indicators(df_1h)
             df_3h = TechnicalAnalyzer.calculate_indicators(df_3h)
             
-            # Get pattern analysis
-            patterns = TechnicalAnalyzer.get_pattern_analysis(df_15m)
-            
             # Determine trends
             trend_3h = "BULLISH" if df_3h['ema_20'].iloc[-1] > df_3h['ema_50'].iloc[-1] else "BEARISH"
             trend_1h = "BULLISH" if df_1h['ema_20'].iloc[-1] > df_1h['ema_50'].iloc[-1] else "BEARISH"
             
             price = float(df_15m['close'].iloc[-1])
-            rsi_15m = float(df_15m['rsi'].iloc[-1]) if not pd.isna(df_15m['rsi'].iloc[-1]) else 50
-            rsi_1h = float(df_1h['rsi'].iloc[-1]) if not pd.isna(df_1h['rsi'].iloc[-1]) else 50
+            rsi = float(df_15m['rsi'].iloc[-1]) if not pd.isna(df_15m['rsi'].iloc[-1]) else 50
             
-            macd_15m = float(df_15m['macd'].iloc[-1] - df_15m['macd_signal'].iloc[-1]) if 'macd' in df_15m.columns else 0
-            
-            print(f"✓ Analysis complete: ${price:.2f}, RSI: {rsi_15m:.1f}")
+            print(f"✓ Analysis complete: ${price:.2f}, RSI: {rsi:.1f}")
             
             return {
                 'coin': coin,
                 'price': price,
                 'trend_3h': trend_3h,
                 'trend_1h': trend_1h,
-                'rsi_15m': rsi_15m,
-                'rsi_1h': rsi_1h,
-                'macd_histogram': macd_15m,
+                'rsi': rsi,
                 'oi': oi['open_interest'],
-                'volume_24h': oi['volume_usd'],
-                'funding_rate': oi['funding_rate'],
                 'liq': liq,
-                'patterns': patterns,
-                'df_15m': df_15m,
-                'df_1h': df_1h,
-                'df_3h': df_3h
+                'df': df_15m
             }
             
         except Exception as e:
@@ -334,234 +288,50 @@ class MarketAnalyzer:
 class AIAnalyzer:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.session = None
-    
-    async def init_session(self):
-        if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=60)
-            )
-    
-    async def close_session(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-    
-    def build_analysis_prompt(self, analysis: Dict) -> str:
-        """Build detailed prompt for DeepSeek V3"""
-        
-        # Get recent price action from last 10 candles
-        df = analysis['df_15m'].tail(10)
-        price_action = []
-        for i, row in df.iterrows():
-            change = ((row['close'] - row['open']) / row['open']) * 100
-            price_action.append(f"${row['close']:.2f} ({change:+.2f}%)")
-        
-        prompt = f"""You are an expert cryptocurrency trading analyst. Analyze this {analysis['coin']} market data and provide trading signals.
-
-MARKET DATA:
-- Current Price: ${analysis['price']:.2f}
-- Trend 3H: {analysis['trend_3h']}
-- Trend 1H: {analysis['trend_1h']}
-- RSI 15m: {analysis['rsi_15m']:.1f}
-- RSI 1H: {analysis['rsi_1h']:.1f}
-- MACD Histogram: {analysis['macd_histogram']:.4f}
-- 24H Volume: ${analysis['volume_24h']:,.0f}
-- Open Interest: {analysis['oi']:,.0f}
-- Funding Rate: {analysis['funding_rate']:.4f}%
-- Long Liquidations: {analysis['liq']['long']:.2f}
-- Short Liquidations: {analysis['liq']['short']:.2f}
-
-PRICE ACTION (Last 10 candles):
-{', '.join(price_action)}
-
-PATTERN ANALYSIS:
-- Price Position in Range: {analysis['patterns'].get('price_position', 0):.1f}%
-- Volume Spike: {analysis['patterns'].get('volume_spike', False)}
-- Volume Ratio: {analysis['patterns'].get('volume_ratio', 1):.2f}x
-- 5-Candle Momentum: {analysis['patterns'].get('momentum_5candles', 0):.2f}%
-- Consolidating: {analysis['patterns'].get('consolidating', False)}
-
-ANALYSIS REQUIREMENTS:
-1. Consider multi-timeframe trend alignment
-2. Analyze RSI divergences and overbought/oversold conditions
-3. Evaluate volume profile and liquidation imbalances
-4. Assess market structure (support/resistance)
-5. Consider funding rate implications
-6. Identify entry timing based on momentum
-
-Respond ONLY with valid JSON in this exact format:
-{{
-    "signal": "LONG" or "SHORT" or "NO_TRADE",
-    "confidence": 0-100,
-    "reasoning": "brief explanation",
-    "key_factors": ["factor1", "factor2", "factor3"],
-    "risk_level": "LOW" or "MEDIUM" or "HIGH",
-    "entry_timing": "IMMEDIATE" or "WAIT_FOR_PULLBACK" or "WAIT_FOR_BREAKOUT"
-}}"""
-        
-        return prompt
-    
-    async def call_deepseek(self, prompt: str) -> Optional[Dict]:
-        """Call DeepSeek V3 API"""
-        try:
-            await self.init_session()
-            
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": "deepseek-chat",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a professional cryptocurrency trading analyst. Always respond with valid JSON only."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.3,
-                "max_tokens": 1000
-            }
-            
-            print("🤖 Calling DeepSeek V3 API...")
-            
-            async with self.session.post(
-                DEEPSEEK_API_URL,
-                headers=headers,
-                json=payload
-            ) as resp:
-                if resp.status != 200:
-                    print(f"❌ DeepSeek API error: {resp.status}")
-                    return None
-                
-                data = await resp.json()
-                
-                if 'choices' not in data or not data['choices']:
-                    print("❌ No response from DeepSeek")
-                    return None
-                
-                content = data['choices'][0]['message']['content'].strip()
-                
-                # Extract JSON from response
-                if '```json' in content:
-                    content = content.split('```json')[1].split('```')[0].strip()
-                elif '```' in content:
-                    content = content.split('```')[1].split('```')[0].strip()
-                
-                ai_response = json.loads(content)
-                print(f"✓ DeepSeek analysis received: {ai_response['signal']} ({ai_response['confidence']}%)")
-                
-                return ai_response
-                
-        except json.JSONDecodeError as e:
-            print(f"❌ Failed to parse DeepSeek response: {e}")
-            return None
-        except Exception as e:
-            print(f"❌ DeepSeek API call failed: {e}")
-            traceback.print_exc()
-            return None
     
     async def analyze(self, analysis: Dict):
-        """Combined Python + AI analysis"""
-        
-        # Python-based analysis
-        python_score = 0
+        score = 0
         reasons = []
         signal = "NO_TRADE"
         
         # Trend analysis
         if analysis['trend_3h'] == "BULLISH" and analysis['trend_1h'] == "BULLISH":
-            python_score += 40
+            score += 50
             signal = "LONG"
             reasons.append("Bullish trend alignment")
         elif analysis['trend_3h'] == "BEARISH" and analysis['trend_1h'] == "BEARISH":
-            python_score += 40
+            score += 50
             signal = "SHORT"
             reasons.append("Bearish trend alignment")
         
         # RSI analysis
-        rsi = analysis['rsi_15m']
+        rsi = analysis['rsi']
         if signal == "LONG" and 30 < rsi < 50:
-            python_score += 15
-            reasons.append("RSI favorable")
+            score += 20
+            reasons.append("RSI favorable for long")
         elif signal == "SHORT" and 50 < rsi < 70:
-            python_score += 15
-            reasons.append("RSI favorable")
+            score += 20
+            reasons.append("RSI favorable for short")
         elif rsi > 75 or rsi < 25:
-            python_score -= 15
-            reasons.append("RSI extreme")
-        
-        # MACD momentum
-        if signal == "LONG" and analysis['macd_histogram'] > 0:
-            python_score += 10
-            reasons.append("MACD bullish")
-        elif signal == "SHORT" and analysis['macd_histogram'] < 0:
-            python_score += 10
-            reasons.append("MACD bearish")
-        
-        # Volume confirmation
-        if analysis['patterns'].get('volume_spike'):
-            python_score += 10
-            reasons.append("Volume spike")
+            score -= 20
+            reasons.append("RSI extreme zone")
         
         # Liquidation analysis
         liq = analysis['liq']
         total = liq['long'] + liq['short']
         if total > 0:
             if signal == "LONG" and (liq['long'] / total) > 0.7:
-                python_score -= 15
-                reasons.append("Heavy long liq")
+                score -= 15
+                reasons.append("Heavy long liquidations")
             elif signal == "SHORT" and (liq['short'] / total) > 0.7:
-                python_score -= 15
-                reasons.append("Heavy short liq")
+                score -= 15
+                reasons.append("Heavy short liquidations")
         
-        python_score = max(0, min(100, python_score))
+        score = max(0, min(100, score))
         
-        # AI Analysis
-        ai_score = python_score  # Default fallback
-        ai_response = None
-        
-        if self.api_key and self.api_key != "YOUR_DEEPSEEK_KEY":
-            try:
-                prompt = self.build_analysis_prompt(analysis)
-                ai_response = await self.call_deepseek(prompt)
-                
-                if ai_response:
-                    ai_signal = ai_response.get('signal', signal)
-                    ai_score = ai_response.get('confidence', python_score)
-                    
-                    # Combine signals - if they agree, boost confidence
-                    if ai_signal == signal:
-                        # Both agree - weighted average favoring AI
-                        final_score = (python_score * 0.3) + (ai_score * 0.7)
-                        reasons.append(f"AI confirms: {ai_response.get('reasoning', 'Analysis aligned')}")
-                    else:
-                        # Disagreement - be more conservative
-                        final_score = min(python_score, ai_score) * 0.7
-                        signal = "NO_TRADE"
-                        reasons.append(f"AI disagrees: {ai_signal}")
-                    
-                    # Add AI key factors
-                    if 'key_factors' in ai_response:
-                        reasons.extend(ai_response['key_factors'][:2])
-                else:
-                    final_score = python_score
-                    reasons.append("AI unavailable")
-            except Exception as e:
-                print(f"⚠ AI analysis failed: {e}")
-                final_score = python_score
-                reasons.append("AI error")
-        else:
-            final_score = python_score
-            reasons.append("AI not configured")
-        
-        # Final decision threshold
-        if final_score < 60:
+        if score < 60:
             signal = "NO_TRADE"
+            reasons.append("Confidence below threshold")
         
         # Calculate targets
         price = analysis['price']
@@ -578,27 +348,22 @@ Respond ONLY with valid JSON in this exact format:
         else:
             sl = tp1 = tp2 = None
         
-        await self.close_session()
-        
         return TradingSignal(
             signal=signal,
-            confidence=final_score,
+            confidence=score,
             entry=entry,
             sl=sl,
             tp1=tp1,
             tp2=tp2,
-            reason=', '.join(reasons[:4]),  # Limit to 4 reasons
-            python_score=python_score,
-            ai_score=ai_score,
-            ai_analysis=ai_response
+            reason=', '.join(reasons),
+            python_score=score,
+            ai_analysis={'confidence': score}
         )
 
 class ChartGenerator:
     @staticmethod
     def create_chart(df, analysis, signal, coin):
-        """Generate trading chart - returns None if fails"""
         try:
-            print(f"🎨 Generating chart for {coin}...")
             fig = make_subplots(
                 rows=2, cols=1,
                 row_heights=[0.7, 0.3],
@@ -633,26 +398,6 @@ class ChartGenerator:
                     y=df_plot['ema_50'],
                     name='EMA50',
                     line=dict(color='orange', width=1)
-                ), row=1, col=1)
-            
-            # Bollinger Bands
-            if 'bb_high' in df_plot.columns:
-                fig.add_trace(go.Scatter(
-                    x=df_plot['timestamp'],
-                    y=df_plot['bb_high'],
-                    name='BB Upper',
-                    line=dict(color='gray', width=1, dash='dash'),
-                    showlegend=False
-                ), row=1, col=1)
-                
-                fig.add_trace(go.Scatter(
-                    x=df_plot['timestamp'],
-                    y=df_plot['bb_low'],
-                    name='BB Lower',
-                    line=dict(color='gray', width=1, dash='dash'),
-                    fill='tonexty',
-                    fillcolor='rgba(128,128,128,0.1)',
-                    showlegend=False
                 ), row=1, col=1)
             
             # Trading levels
@@ -694,7 +439,7 @@ class ChartGenerator:
             # Title
             sig_text = "🟢 LONG" if signal.signal == "LONG" else "🔴 SHORT" if signal.signal == "SHORT" else "⚪ NO TRADE"
             fig.update_layout(
-                title=f"{coin} - {sig_text} | Confidence: {signal.confidence:.0f}% (Py:{signal.python_score:.0f}% AI:{signal.ai_score:.0f}%)",
+                title=f"{coin} - {sig_text} | Confidence: {signal.confidence:.0f}%",
                 xaxis_rangeslider_visible=False,
                 height=800,
                 template='plotly_white',
@@ -702,18 +447,13 @@ class ChartGenerator:
             )
             
             filename = f"/tmp/{coin}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            
-            # Try to save chart - if fails, continue without it
-            try:
-                fig.write_image(filename, width=1400, height=800)
-                print(f"✓ Chart saved: {filename}")
-                return filename
-            except Exception as img_error:
-                print(f"⚠ Chart save failed (continuing without chart): {img_error}")
-                return None
+            fig.write_image(filename, width=1400, height=800)
+            print(f"✓ Chart saved: {filename}")
+            return filename
             
         except Exception as e:
-            print(f"⚠ Chart generation skipped: {e}")
+            print(f"Chart generation error: {e}")
+            traceback.print_exc()
             return None
 
 class TradingBot:
@@ -731,15 +471,119 @@ class TradingBot:
 
 **Signal:** {signal.signal}
 **Confidence:** {signal.confidence:.0f}%
-_Python: {signal.python_score:.0f}% | AI: {signal.ai_score:.0f}%_
 
 **Market Data:**
 Price: ${analysis['price']:.2f}
 Trend 3H: {analysis['trend_3h']}
 Trend 1H: {analysis['trend_1h']}
-RSI 15m: {analysis['rsi_15m']:.1f}
-RSI 1H: {analysis['rsi_1h']:.1f}
+RSI: {analysis['rsi']:.1f}
 Open Interest: {analysis['oi']:,.0f}
-24H Volume: ${analysis['volume_24h']:,.0f}
-Funding Rate: {analysis['funding_rate']:.4f}%
 """
+        
+        if signal.entry:
+            msg += f"""
+**Trading Levels:**
+Entry: ${signal.entry:.2f}
+Stop Loss: ${signal.sl:.2f}
+Target 1: ${signal.tp1:.2f}
+Target 2: ${signal.tp2:.2f}
+"""
+        
+        msg += f"\n**Analysis:** {signal.reason}\n\n_{datetime.now().strftime('%Y-%m-%d %H:%M')} UTC_"
+        
+        try:
+            if chart_path and os.path.exists(chart_path):
+                with open(chart_path, 'rb') as photo:
+                    await self.bot.send_photo(
+                        chat_id=self.chat_id,
+                        photo=photo,
+                        caption=msg,
+                        parse_mode='Markdown'
+                    )
+                print(f"✓ Signal with chart sent for {coin}")
+            else:
+                await self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=msg,
+                    parse_mode='Markdown'
+                )
+                print(f"✓ Signal sent for {coin} (no chart)")
+                
+        except Exception as e:
+            print(f"❌ Send error: {e}")
+            traceback.print_exc()
+    
+    async def analyze_and_signal(self, coin: str):
+        try:
+            analysis = await self.analyzer.analyze(coin)
+            signal = await self.ai.analyze(analysis)
+            
+            print(f"\n📊 {coin} Result: {signal.signal} | Confidence: {signal.confidence:.0f}%")
+            
+            # Generate chart
+            chart_path = None
+            if signal.confidence >= 60 and signal.signal in ['LONG', 'SHORT']:
+                chart_path = self.chart.create_chart(analysis['df'], analysis, signal, coin)
+                await self.send_signal(coin, analysis, signal, chart_path)
+            else:
+                print(f"⚠ No signal sent (confidence: {signal.confidence:.0f}%)")
+            
+            # Cleanup
+            if chart_path and os.path.exists(chart_path):
+                os.remove(chart_path)
+                
+        except Exception as e:
+            print(f"❌ {coin} error: {e}")
+            traceback.print_exc()
+    
+    async def run(self):
+        print("\n" + "="*50)
+        print("🤖 TRADING BOT STARTED")
+        print("="*50)
+        
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text="🤖 *Trading Bot Started!*\n\nMonitoring BTC and ETH...",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            print(f"⚠ Could not send startup message: {e}")
+        
+        cycle = 0
+        while True:
+            try:
+                cycle += 1
+                print(f"\n{'='*50}")
+                print(f"Cycle #{cycle} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'='*50}")
+                
+                await self.analyze_and_signal("BTC")
+                await asyncio.sleep(5)
+                
+                await self.analyze_and_signal("ETH")
+                
+                print(f"\n⏳ Waiting 30 minutes until next cycle...")
+                await asyncio.sleep(1800)  # 30 minutes
+                
+            except KeyboardInterrupt:
+                print("\n🛑 Shutting down...")
+                break
+            except Exception as e:
+                print(f"❌ Cycle error: {e}")
+                traceback.print_exc()
+                print("⏳ Waiting 60 seconds before retry...")
+                await asyncio.sleep(60)
+
+async def main():
+    bot = TradingBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    await bot.run()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye!")
+    except Exception as e:
+        print(f"💥 Fatal error: {e}")
+        traceback.print_exc()
