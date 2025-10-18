@@ -596,7 +596,9 @@ Respond ONLY with valid JSON in this exact format:
 class ChartGenerator:
     @staticmethod
     def create_chart(df, analysis, signal, coin):
+        """Generate trading chart - returns None if fails"""
         try:
+            print(f"🎨 Generating chart for {coin}...")
             fig = make_subplots(
                 rows=2, cols=1,
                 row_heights=[0.7, 0.3],
@@ -700,13 +702,18 @@ class ChartGenerator:
             )
             
             filename = f"/tmp/{coin}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            fig.write_image(filename, width=1400, height=800)
-            print(f"✓ Chart saved: {filename}")
-            return filename
+            
+            # Try to save chart - if fails, continue without it
+            try:
+                fig.write_image(filename, width=1400, height=800)
+                print(f"✓ Chart saved: {filename}")
+                return filename
+            except Exception as img_error:
+                print(f"⚠ Chart save failed (continuing without chart): {img_error}")
+                return None
             
         except Exception as e:
-            print(f"Chart generation error: {e}")
-            traceback.print_exc()
+            print(f"⚠ Chart generation skipped: {e}")
             return None
 
 class TradingBot:
