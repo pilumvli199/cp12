@@ -228,14 +228,16 @@ class MarketAnalyzer:
             print(f"Analyzing {coin}")
             print(f"{'='*50}")
             
-            # Fetch with delays
-            df_30m = await self.fetcher.get_candlestick_data(instrument, "30", 500)
+            # Fetch with delays - Use only supported resolutions
+            # Deribit supports: 1, 3, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1D
+            df_15m = await self.fetcher.get_candlestick_data(instrument, "15", 500)
             await asyncio.sleep(1)
             
             df_1h = await self.fetcher.get_candlestick_data(instrument, "60", 300)
             await asyncio.sleep(1)
             
-            df_4h = await self.fetcher.get_candlestick_data(instrument, "240", 200)
+            # Use 180 (3 hours) instead of 240 (4 hours) which is unsupported
+            df_3h = await self.fetcher.get_candlestick_data(instrument, "180", 200)
             await asyncio.sleep(1)
             
             # Check if we got data
