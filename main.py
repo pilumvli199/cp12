@@ -70,7 +70,7 @@ class DeribitDataFetcher:
         await self.init_session()
         await self.rate_limit()
         
-        resolution = {"15": 15, "30": 30, "60": 60, "240": 240}.get(timeframe, 30)
+        resolution = {"15": 15, "30": 30, "60": 60, "180": 180}.get(timeframe, 30)
         end_time = int(datetime.now().timestamp() * 1000)
         start_time = end_time - (count * resolution * 60 * 1000)
         
@@ -241,12 +241,12 @@ class MarketAnalyzer:
             await asyncio.sleep(1)
             
             # Check if we got data
-            if df_30m.empty:
-                raise Exception(f"No 30m data for {instrument}")
+            if df_15m.empty:
+                raise Exception(f"No 15m data for {instrument}")
             if df_1h.empty:
                 raise Exception(f"No 1h data for {instrument}")
-            if df_4h.empty:
-                raise Exception(f"No 4h data for {instrument}")
+            if df_3h.empty:
+                raise Exception(f"No 3h data for {instrument}")
             
             print(f"✓ All timeframes loaded")
             
@@ -255,28 +255,28 @@ class MarketAnalyzer:
             liq = await self.fetcher.get_liquidations(coin)
             
             # Calculate indicators
-            df_30m = TechnicalAnalyzer.calculate_indicators(df_30m)
+            df_15m = TechnicalAnalyzer.calculate_indicators(df_15m)
             df_1h = TechnicalAnalyzer.calculate_indicators(df_1h)
-            df_4h = TechnicalAnalyzer.calculate_indicators(df_4h)
+            df_3h = TechnicalAnalyzer.calculate_indicators(df_3h)
             
             # Determine trends
-            trend_4h = "BULLISH" if df_4h['ema_20'].iloc[-1] > df_4h['ema_50'].iloc[-1] else "BEARISH"
+            trend_3h = "BULLISH" if df_3h['ema_20'].iloc[-1] > df_3h['ema_50'].iloc[-1] else "BEARISH"
             trend_1h = "BULLISH" if df_1h['ema_20'].iloc[-1] > df_1h['ema_50'].iloc[-1] else "BEARISH"
             
-            price = float(df_30m['close'].iloc[-1])
-            rsi = float(df_30m['rsi'].iloc[-1]) if not pd.isna(df_30m['rsi'].iloc[-1]) else 50
+            price = float(df_15m['close'].iloc[-1])
+            rsi = float(df_15m['rsi'].iloc[-1]) if not pd.isna(df_15m['rsi'].iloc[-1]) else 50
             
             print(f"✓ Analysis complete: ${price:.2f}, RSI: {rsi:.1f}")
             
             return {
                 'coin': coin,
                 'price': price,
-                'trend_4h': trend_4h,
+                'trend_3h': trend_3h,
                 'trend_1h': trend_1h,
                 'rsi': rsi,
                 'oi': oi['open_interest'],
                 'liq': liq,
-                'df': df_30m
+                'df': df_15m
             }
             
         except Exception as e:
@@ -295,11 +295,11 @@ class AIAnalyzer:
         signal = "NO_TRADE"
         
         # Trend analysis
-        if analysis['trend_4h'] == "BULLISH" and analysis['trend_1h'] == "BULLISH":
+        if analysis['trend_3h'] == "BULLISH" and analysis['trend_1h'] == "BULLISH":
             score += 50
             signal = "LONG"
             reasons.append("Bullish trend alignment")
-        elif analysis['trend_4h'] == "BEARISH" and analysis['trend_1h'] == "BEARISH":
+        elif analysis['trend_3h'] == "BEARISH" and analysis['trend_1h'] == "BEARISH":
             score += 50
             signal = "SHORT"
             reasons.append("Bearish trend alignment")
@@ -367,7 +367,7 @@ class ChartGenerator:
             fig = make_subplots(
                 rows=2, cols=1,
                 row_heights=[0.7, 0.3],
-                subplot_titles=(f'{coin} 30min', 'RSI'),
+                subplot_titles=(f'{coin} 15min', 'RSI'),
                 vertical_spacing=0.05
             )
             
@@ -474,7 +474,7 @@ class TradingBot:
 
 **Market Data:**
 Price: ${analysis['price']:.2f}
-Trend 4H: {analysis['trend_4h']}
+Trend 3H: {analysis['trend_3h']}
 Trend 1H: {analysis['trend_1h']}
 RSI: {analysis['rsi']:.1f}
 Open Interest: {analysis['oi']:,.0f}
