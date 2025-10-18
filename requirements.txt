@@ -15,8 +15,8 @@ python-telegram-bot==20.7
 plotly==5.18.0
 kaleido==0.2.1
 
-# Technical Analysis (Alternative to TA-Lib)
-pandas-ta==0.3.14b0
+# Technical Analysis (NO system dependencies needed)
+pandas-ta==0.3.14b
 
 # HTTP Requests
 requests==2.31.0
