@@ -1,6 +1,5 @@
 # Core Dependencies
 aiohttp==3.9.1
-asyncio==3.4.3
 
 # Data Processing
 pandas==2.1.4
@@ -16,8 +15,8 @@ python-telegram-bot==20.7
 plotly==5.18.0
 kaleido==0.2.1
 
-# Technical Analysis
-TA-Lib==0.4.28
+# Technical Analysis (Alternative to TA-Lib)
+pandas-ta==0.3.14b0
 
 # HTTP Requests
 requests==2.31.0
