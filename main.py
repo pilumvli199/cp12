@@ -16,7 +16,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
 from typing import Dict, List, Tuple, Optional
-import pandas_ta as ta  # CHANGED: Using pandas-ta
+import ta  # Using 'ta' library - stable technical analysis
 import traceback
 from dataclasses import dataclass
 
@@ -359,34 +359,34 @@ class TechnicalAnalyzer:
     
     @staticmethod
     def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate technical indicators using pandas-ta"""
+        """Calculate technical indicators using ta library"""
         if len(df) < 200:
             print(f"⚠️ Insufficient data for indicators: {len(df)} candles")
             return df
         
         try:
             # RSI
-            df['rsi'] = ta.rsi(df['close'], length=14)
+            df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
             
             # MACD
-            macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-            df['macd'] = macd['MACD_12_26_9']
-            df['macd_signal'] = macd['MACDs_12_26_9']
-            df['macd_hist'] = macd['MACDh_12_26_9']
+            macd_indicator = ta.trend.MACD(df['close'], window_fast=12, window_slow=26, window_sign=9)
+            df['macd'] = macd_indicator.macd()
+            df['macd_signal'] = macd_indicator.macd_signal()
+            df['macd_hist'] = macd_indicator.macd_diff()
             
             # Bollinger Bands
-            bbands = ta.bbands(df['close'], length=20, std=2)
-            df['bb_upper'] = bbands['BBU_20_2.0']
-            df['bb_middle'] = bbands['BBM_20_2.0']
-            df['bb_lower'] = bbands['BBL_20_2.0']
+            bb_indicator = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+            df['bb_upper'] = bb_indicator.bollinger_hband()
+            df['bb_middle'] = bb_indicator.bollinger_mavg()
+            df['bb_lower'] = bb_indicator.bollinger_lband()
             
             # ATR
-            df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+            df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
             
             # EMAs
-            df['ema_20'] = ta.ema(df['close'], length=20)
-            df['ema_50'] = ta.ema(df['close'], length=50)
-            df['ema_200'] = ta.ema(df['close'], length=200)
+            df['ema_20'] = ta.trend.EMAIndicator(df['close'], window=20).ema_indicator()
+            df['ema_50'] = ta.trend.EMAIndicator(df['close'], window=50).ema_indicator()
+            df['ema_200'] = ta.trend.EMAIndicator(df['close'], window=200).ema_indicator()
             
             # Volume SMA
             df['volume_sma'] = df['volume'].rolling(window=20).mean()
