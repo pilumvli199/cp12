@@ -197,7 +197,13 @@ class DeltaExchangeClient:
 # ==================== TELEGRAM FORMATTER ====================
 class TelegramFormatter:
     @staticmethod
-    def format_detailed_option_chain(chain_data):
+    def format_large_number(num):
+        """Format large numbers (K for thousands)"""
+        if num >= 1000:
+            return f"{num/1000:.1f}K"
+        return f"{num:.0f}"
+    
+    def format_detailed_option_chain(self, chain_data):
         """Format detailed option chain like Delta Exchange UI"""
         if not chain_data:
             return "❌ No data available"
@@ -293,13 +299,6 @@ class TelegramFormatter:
         message += "\n⚡ <i>Delta Exchange India</i>"
         
         return message
-    
-    @staticmethod
-    def format_large_number(num):
-        """Format large numbers (K for thousands)"""
-        if num >= 1000:
-            return f"{num/1000:.1f}K"
-        return f"{num:.0f}"
 
 # ==================== MAIN BOT ====================
 class DeltaOptionBot:
