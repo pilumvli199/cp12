@@ -22,8 +22,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Environment Variables
-DELTA_API_KEY = os.getenv('DELTA_API_KEY')
-DELTA_API_SECRET = os.getenv('DELTA_API_SECRET')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
@@ -32,189 +30,167 @@ BASE_URL = "https://api.india.delta.exchange"
 
 # ==================== DELTA API CLIENT ====================
 class DeltaExchangeClient:
-    def __init__(self, api_key, api_secret):
-        self.api_key = api_key
-        self.api_secret = api_secret
+    def __init__(self):
         self.headers = {
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         }
     
-    def get_products(self):
-        """Get all available products"""
-        try:
-            url = f"{BASE_URL}/v2/products"
-            response = requests.get(url, headers=self.headers, timeout=10)
-            
-            if response.status_code == 200:
-                json_data = response.json()
-                
-                # Check if response is successful
-                if not json_data.get('success'):
-                    logger.error(f"❌ Products API returned unsuccessful response")
-                    return []
-                
-                return json_data.get('result', [])
-            else:
-                logger.error(f"❌ Products API failed: {response.status_code} - {response.text}")
-                return []
-        except Exception as e:
-            logger.error(f"❌ Get products error: {e}")
-            return []
-    
     def get_ticker(self, symbol):
-        """Get LTP for a symbol"""
+        """Get ticker for a symbol with timeout"""
         try:
             url = f"{BASE_URL}/v2/tickers/{symbol}"
-            response = requests.get(url, headers=self.headers, timeout=10)
+            response = requests.get(url, headers=self.headers, timeout=5)
             
             if response.status_code == 200:
                 json_data = response.json()
                 
-                # Check if response is successful
                 if not json_data.get('success'):
-                    logger.error(f"❌ Ticker API returned unsuccessful response for {symbol}")
+                    logger.error(f"❌ Ticker API unsuccessful for {symbol}")
                     return None
                 
                 data = json_data.get('result', {})
                 if not data:
-                    logger.error(f"❌ No result data in ticker response for {symbol}")
+                    logger.error(f"❌ No data for {symbol}")
                     return None
                 
                 return {
                     'symbol': data.get('symbol', symbol),
                     'mark_price': float(data.get('mark_price', 0)),
                     'spot_price': float(data.get('spot_price', 0)),
+                    'close': float(data.get('close', 0)),
                     'volume': float(data.get('volume', 0)),
-                    'turnover_usd': float(data.get('turnover_usd', 0))
+                    'turnover_usd': float(data.get('turnover_usd', 0)),
+                    'oi': data.get('oi', 0)
                 }
             else:
-                logger.error(f"❌ Ticker API failed for {symbol}: {response.status_code} - {response.text}")
+                logger.error(f"❌ Ticker failed {symbol}: {response.status_code}")
                 return None
+                
+        except requests.exceptions.Timeout:
+            logger.error(f"⏱️ Timeout for {symbol}")
+            return None
         except Exception as e:
-            logger.error(f"❌ Get ticker error for {symbol}: {e}")
+            logger.error(f"❌ Ticker error {symbol}: {e}")
             return None
     
-    def get_option_chain(self, underlying='BTC'):
-        """Get option chain for BTC/ETH"""
+    def get_option_chain_simple(self, underlying='BTC', expiry_date=None):
+        """Get option chain using tickers API - faster method"""
         try:
-            # Get spot price first
-            spot_symbol = f"{underlying}USD"
-            ticker = self.get_ticker(spot_symbol)
+            # Get perpetual futures price first
+            perp_symbol = f"{underlying}USD"
+            ticker = self.get_ticker(perp_symbol)
             
             if not ticker:
-                logger.warning(f"⚠️ Could not get ticker for {spot_symbol}")
+                logger.warning(f"⚠️ No ticker for {perp_symbol}")
                 return None
             
-            spot_price = ticker.get('spot_price') or ticker.get('mark_price', 0)
+            # Use mark_price or close price
+            spot_price = ticker.get('mark_price') or ticker.get('close', 0)
             
             if spot_price == 0:
-                logger.warning(f"⚠️ Spot price is 0 for {underlying}")
+                logger.warning(f"⚠️ Price is 0 for {underlying}")
                 return None
             
+            # If no expiry provided, get tickers for all options
+            if not expiry_date:
+                # Get current or nearest weekly expiry (Friday)
+                from datetime import datetime, timedelta
+                today = datetime.now()
+                days_until_friday = (4 - today.weekday()) % 7
+                if days_until_friday == 0:
+                    days_until_friday = 7
+                next_friday = today + timedelta(days=days_until_friday)
+                expiry_date = next_friday.strftime('%d-%m-%Y')
+            
+            # Fetch option chain
+            url = f"{BASE_URL}/v2/tickers"
+            params = {
+                'contract_types': 'call_options,put_options',
+                'underlying_asset_symbols': underlying,
+                'expiry_date': expiry_date
+            }
+            
+            logger.info(f"📡 Fetching options for {underlying} expiry {expiry_date}")
+            
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+            
+            if response.status_code != 200:
+                logger.error(f"❌ Options API failed: {response.status_code}")
+                return None
+            
+            json_data = response.json()
+            
+            if not json_data.get('success'):
+                logger.error(f"❌ Options API unsuccessful")
+                return None
+            
+            options_data = json_data.get('result', [])
+            
+            if not options_data:
+                logger.warning(f"⚠️ No options data for {underlying} on {expiry_date}")
+                return None
+            
+            # Calculate ATM
             atm_strike = self.round_to_strike(spot_price, underlying)
             
-            # Get all products
-            all_products = self.get_products()
+            # Filter options near ATM (±5 strikes for telegram message limit)
+            strike_range = self.get_strike_range(atm_strike, underlying, count=5)
             
-            if not all_products:
-                logger.warning(f"⚠️ No products found")
-                return None
-            
-            # Filter options near ATM (±10 strikes)
             options = []
-            strike_range = self.get_strike_range(atm_strike, underlying)
-            
-            for product in all_products:
-                contract_type = product.get('contract_type', '')
-                
-                if contract_type not in ['call_options', 'put_options']:
+            for opt in options_data:
+                strike = opt.get('strike_price')
+                if not strike:
                     continue
                 
-                # Check if product is for our underlying
-                symbol = product.get('symbol', '')
-                if underlying not in symbol:
+                strike_float = float(strike)
+                if strike_float not in strike_range:
                     continue
                 
-                strike = product.get('strike_price')
-                if strike and float(strike) in strike_range:
-                    # Get ticker for this option
-                    option_ticker = self.get_ticker(symbol)
-                    
-                    # Get orderbook for this option
-                    orderbook = self.get_orderbook(symbol)
-                    
-                    option_data = {
-                        'symbol': symbol,
-                        'strike': float(strike),
-                        'type': 'CE' if contract_type == 'call_options' else 'PE',
-                        'expiry': product.get('settlement_time', 'N/A'),
-                        'mark_price': float(product.get('mark_price', 0)) if product.get('mark_price') else 0,
-                        'open_interest': float(option_ticker.get('oi', 0)) if option_ticker else 0,
-                        'volume': float(option_ticker.get('volume', 0)) if option_ticker else 0,
-                        'best_bid': orderbook.get('best_bid', 0) if orderbook else 0,
-                        'best_ask': orderbook.get('best_ask', 0) if orderbook else 0
-                    }
-                    options.append(option_data)
+                option_data = {
+                    'symbol': opt.get('symbol', ''),
+                    'strike': strike_float,
+                    'type': 'CE' if 'C-' in opt.get('symbol', '') else 'PE',
+                    'mark_price': float(opt.get('mark_price', 0)),
+                    'open_interest': float(opt.get('oi', 0)),
+                    'volume': float(opt.get('volume', 0)),
+                    'best_bid': float(opt.get('quotes', {}).get('best_bid', 0)),
+                    'best_ask': float(opt.get('quotes', {}).get('best_ask', 0)),
+                }
+                options.append(option_data)
             
             return {
                 'underlying': underlying,
                 'spot_price': spot_price,
                 'atm_strike': atm_strike,
+                'expiry_date': expiry_date,
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'options': sorted(options, key=lambda x: (x['strike'], x['type']))
             }
             
-        except Exception as e:
-            logger.error(f"❌ Get option chain error for {underlying}: {e}")
-            return None
-    
-    def get_orderbook(self, symbol):
-        """Get orderbook for a symbol"""
-        try:
-            url = f"{BASE_URL}/v2/l2orderbook/{symbol}"
-            response = requests.get(url, headers=self.headers, timeout=10)
-            
-            if response.status_code == 200:
-                json_data = response.json()
-                
-                # Check if response is successful
-                if not json_data.get('success'):
-                    return None
-                
-                data = json_data.get('result', {})
-                if not data:
-                    return None
-                
-                buy = data.get('buy', [])
-                sell = data.get('sell', [])
-                
-                return {
-                    'best_bid': float(buy[0]['price']) if buy else 0,
-                    'best_ask': float(sell[0]['price']) if sell else 0
-                }
+        except requests.exceptions.Timeout:
+            logger.error(f"⏱️ Timeout fetching options for {underlying}")
             return None
         except Exception as e:
+            logger.error(f"❌ Option chain error for {underlying}: {e}")
             return None
     
     def round_to_strike(self, price, underlying):
         """Round price to nearest strike"""
         if underlying == 'BTC':
-            # BTC strikes in 1000s (e.g., 95000, 96000)
             return round(price / 1000) * 1000
         else:  # ETH
-            # ETH strikes in 100s (e.g., 3400, 3500)
             return round(price / 100) * 100
     
-    def get_strike_range(self, atm_strike, underlying):
-        """Get ±10 strikes around ATM"""
+    def get_strike_range(self, atm_strike, underlying, count=5):
+        """Get ±count strikes around ATM"""
         if underlying == 'BTC':
             step = 1000
         else:  # ETH
             step = 100
         
         strikes = []
-        for i in range(-10, 11):
+        for i in range(-count, count + 1):
             strikes.append(atm_strike + (i * step))
         return strikes
 
@@ -229,165 +205,149 @@ class TelegramFormatter:
         underlying = chain_data['underlying']
         spot = chain_data['spot_price']
         atm = chain_data['atm_strike']
+        expiry = chain_data.get('expiry_date', 'N/A')
         timestamp = chain_data['timestamp']
         options = chain_data['options']
         
         # Header
         message = f"""
-🔔 {underlying} OPTION CHAIN UPDATE
+🔔 <b>{underlying} OPTION CHAIN</b>
 
-📊 Spot Price: ${spot:,.2f}
-🎯 ATM Strike: ${atm:,.0f}
-🕐 Time: {timestamp}
+📊 Spot: <b>${spot:,.2f}</b>
+🎯 ATM: <b>${atm:,.0f}</b>
+📅 Expiry: {expiry}
+🕐 {timestamp}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━
 """
         
         if not options:
-            message += "\n⚠️ No options data available\n"
+            message += "\n⚠️ No options available\n"
             return message
         
         # Separate CE and PE
         ce_options = [opt for opt in options if opt['type'] == 'CE']
         pe_options = [opt for opt in options if opt['type'] == 'PE']
         
-        # Group by strike
+        # Get unique strikes
         strikes = sorted(list(set([opt['strike'] for opt in options])))
         
-        message += "\n📈 CALL OPTIONS (CE):\n"
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        # Calls
+        message += "\n📈 <b>CALLS (CE)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         
-        for strike in strikes[:5]:  # Show only top 5 strikes
+        for strike in strikes:
             ce = next((opt for opt in ce_options if opt['strike'] == strike), None)
-            
             if ce:
-                mark = "🎯" if strike == atm else "  "
-                message += f"\n{mark} Strike: ${ce['strike']:,.0f}\n"
-                message += f"   Premium: ${ce['mark_price']:.2f}\n"
-                message += f"   OI: {ce['open_interest']:,.0f}\n"
-                message += f"   Vol: {ce['volume']:,.0f}\n"
-                if ce['best_bid'] > 0 or ce['best_ask'] > 0:
-                    message += f"   Bid/Ask: ${ce['best_bid']:.2f}/${ce['best_ask']:.2f}\n"
+                mark = "🎯 " if strike == atm else ""
+                message += f"\n{mark}<b>Strike ${ce['strike']:,.0f}</b>\n"
+                message += f"Premium: ${ce['mark_price']:.2f} | "
+                message += f"OI: {ce['open_interest']:,.0f}\n"
         
-        message += "\n\n📉 PUT OPTIONS (PE):\n"
-        message += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        # Puts
+        message += "\n\n📉 <b>PUTS (PE)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
         
-        for strike in strikes[:5]:  # Show only top 5 strikes
+        for strike in strikes:
             pe = next((opt for opt in pe_options if opt['strike'] == strike), None)
-            
             if pe:
-                mark = "🎯" if strike == atm else "  "
-                message += f"\n{mark} Strike: ${pe['strike']:,.0f}\n"
-                message += f"   Premium: ${pe['mark_price']:.2f}\n"
-                message += f"   OI: {pe['open_interest']:,.0f}\n"
-                message += f"   Vol: {pe['volume']:,.0f}\n"
-                if pe['best_bid'] > 0 or pe['best_ask'] > 0:
-                    message += f"   Bid/Ask: ${pe['best_bid']:.2f}/${pe['best_ask']:.2f}\n"
+                mark = "🎯 " if strike == atm else ""
+                message += f"\n{mark}<b>Strike ${pe['strike']:,.0f}</b>\n"
+                message += f"Premium: ${pe['mark_price']:.2f} | "
+                message += f"OI: {pe['open_interest']:,.0f}\n"
         
-        message += "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        message += "⚡ Delta Exchange India\n"
+        message += "\n━━━━━━━━━━━━━━━━━━━━\n⚡ Delta Exchange India"
         
         return message
 
 # ==================== MAIN BOT ====================
 class DeltaTestBot:
     def __init__(self):
-        self.client = DeltaExchangeClient(DELTA_API_KEY, DELTA_API_SECRET)
+        self.client = DeltaExchangeClient()
         self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
         self.formatter = TelegramFormatter()
     
     async def send_telegram_message(self, message):
         """Send message to Telegram"""
         try:
-            # Split long messages
             max_length = 4096
             if len(message) > max_length:
-                # Send in parts
                 parts = [message[i:i+max_length] for i in range(0, len(message), max_length)]
                 for part in parts:
                     await self.telegram_bot.send_message(
                         chat_id=TELEGRAM_CHAT_ID,
-                        text=part
+                        text=part,
+                        parse_mode='HTML'
                     )
-                    await asyncio.sleep(1)  # Avoid rate limit
+                    await asyncio.sleep(1)
             else:
                 await self.telegram_bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
-                    text=message
+                    text=message,
+                    parse_mode='HTML'
                 )
-            logger.info("✅ Message sent to Telegram")
+            logger.info("✅ Message sent")
         except Exception as e:
             logger.error(f"❌ Telegram error: {e}")
     
     async def fetch_and_send_data(self, underlying):
         """Fetch option chain and send to Telegram"""
         try:
-            logger.info(f"🔍 Fetching {underlying} data...")
+            logger.info(f"🔍 Fetching {underlying}...")
             
-            # Get option chain
-            chain_data = self.client.get_option_chain(underlying)
+            chain_data = self.client.get_option_chain_simple(underlying)
             
             if chain_data:
-                # Format message
                 message = self.formatter.format_option_chain_message(chain_data)
-                
-                # Send to Telegram
                 await self.send_telegram_message(message)
             else:
                 logger.warning(f"⚠️ No data for {underlying}")
+                await self.send_telegram_message(f"⚠️ No data available for {underlying}")
                 
         except Exception as e:
-            logger.error(f"❌ Fetch error for {underlying}: {e}")
+            logger.error(f"❌ Error for {underlying}: {e}")
     
     async def run(self):
-        """Main loop - fetch every 1 minute"""
+        """Main loop"""
         logger.info("="*50)
-        logger.info("🚀 DELTA EXCHANGE TEST BOT STARTED")
+        logger.info("🚀 DELTA BOT STARTED")
         logger.info("="*50)
         
-        # Send startup message
         startup_msg = """
-🚀 DELTA TEST BOT STARTED
+🚀 <b>DELTA BOT STARTED</b>
 
 📊 Monitoring: BTC & ETH
 ⏱️ Interval: 1 minute
-📡 Data: LTP + Option Chain (ATM ±10)
+📡 Data: Option Chain (ATM ±5)
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-⚡ Status: 🟢 ACTIVE
+━━━━━━━━━━━━━━━━━━━━
+⚡ Status: 🟢 <b>ACTIVE</b>
 """
         await self.send_telegram_message(startup_msg)
         
         while True:
             try:
-                # Fetch BTC data
                 await self.fetch_and_send_data('BTC')
-                await asyncio.sleep(5)  # Wait 5 sec between BTC and ETH
+                await asyncio.sleep(5)
                 
-                # Fetch ETH data
                 await self.fetch_and_send_data('ETH')
                 
-                # Wait 1 minute before next cycle
-                logger.info("⏳ Waiting 1 minute for next update...\n")
-                await asyncio.sleep(55)  # 55 + 5 = 60 seconds total
+                logger.info("⏳ Waiting 1 minute...\n")
+                await asyncio.sleep(55)
                 
             except KeyboardInterrupt:
-                logger.info("🛑 Bot stopped by user")
+                logger.info("🛑 Bot stopped")
                 break
             except Exception as e:
-                logger.error(f"❌ Main loop error: {e}")
+                logger.error(f"❌ Main error: {e}")
                 await asyncio.sleep(60)
 
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
-    # Validate environment variables
     if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
-        logger.error("❌ Missing environment variables!")
-        logger.error("Required: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+        logger.error("❌ Missing env vars!")
         exit(1)
     
     try:
         bot = DeltaTestBot()
         asyncio.run(bot.run())
     except Exception as e:
-        logger.error(f"💥 Fatal error: {e}")
+        logger.error(f"💥 Fatal: {e}")
