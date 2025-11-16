@@ -1,21 +1,2 @@
-# Core Dependencies
-aiohttp==3.9.1
-python-telegram-bot==20.7
-redis==5.0.1
-
-# Data Processing & Analysis
-numpy==1.26.4
-pandas==2.1.4
-
-# Charting & Visualization
-matplotlib==3.8.2
-
-# Environment Variables
-python-dotenv==1.0.0
-
-# Additional Utilities
-requests==2.31.0
-pytz==2024.1
-
-# Async Support
-asyncio==3.4.3
+requests>=2.31.0
+python-telegram-bot>=20.0
