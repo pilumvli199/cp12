@@ -143,19 +143,34 @@ class DeltaExchangeClient:
                 if not strike:
                     continue
                 
-                strike_float = float(strike)
+                try:
+                    strike_float = float(strike)
+                except (ValueError, TypeError):
+                    continue
+                    
                 if strike_float not in strike_range:
+                    continue
+                
+                # Safe float conversion with defaults
+                try:
+                    mark_price = float(opt.get('mark_price', 0)) if opt.get('mark_price') else 0
+                    oi = float(opt.get('oi', 0)) if opt.get('oi') else 0
+                    volume = float(opt.get('volume', 0)) if opt.get('volume') else 0
+                    quotes = opt.get('quotes', {})
+                    best_bid = float(quotes.get('best_bid', 0)) if quotes.get('best_bid') else 0
+                    best_ask = float(quotes.get('best_ask', 0)) if quotes.get('best_ask') else 0
+                except (ValueError, TypeError):
                     continue
                 
                 option_data = {
                     'symbol': opt.get('symbol', ''),
                     'strike': strike_float,
                     'type': 'CE' if 'C-' in opt.get('symbol', '') else 'PE',
-                    'mark_price': float(opt.get('mark_price', 0)),
-                    'open_interest': float(opt.get('oi', 0)),
-                    'volume': float(opt.get('volume', 0)),
-                    'best_bid': float(opt.get('quotes', {}).get('best_bid', 0)),
-                    'best_ask': float(opt.get('quotes', {}).get('best_ask', 0)),
+                    'mark_price': mark_price,
+                    'open_interest': oi,
+                    'volume': volume,
+                    'best_bid': best_bid,
+                    'best_ask': best_ask,
                 }
                 options.append(option_data)
             
