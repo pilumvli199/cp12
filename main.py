@@ -1,579 +1,347 @@
-import os
-import asyncio
-import aiohttp
-import redis
-import json
-from datetime import datetime, timedelta
-from telegram import Bot
-from telegram.error import TelegramError
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from io import BytesIO
-import numpy as np
-
-# Configuration
-DERIBIT_API = "https://www.deribit.com/api/v2"
-DEEPSEEK_API = "https://api.deepseek.com/v1/chat/completions"
-DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-
-# Redis connection
-redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-telegram_bot = Bot(token=TELEGRAM_TOKEN)
-
-# Instruments to monitor
-INSTRUMENTS = ["BTC-PERPETUAL", "ETH-PERPETUAL"]
-
-class DeribitDataFetcher:
-    """Fetch data from Deribit Public API"""
-    
-    async def fetch_orderbook(self, session, instrument):
-        """Get order book data"""
-        url = f"{DERIBIT_API}/public/get_order_book"
-        params = {"instrument_name": instrument, "depth": 100}
-        
-        async with session.get(url, params=params) as response:
-            data = await response.json()
-            return data.get("result", {})
-    
-    async def fetch_trades(self, session, instrument):
-        """Get recent trades"""
-        url = f"{DERIBIT_API}/public/get_last_trades_by_instrument"
-        params = {"instrument_name": instrument, "count": 100}
-        
-        async with session.get(url, params=params) as response:
-            data = await response.json()
-            return data.get("result", {}).get("trades", [])
-    
-    async def fetch_candlesticks(self, session, instrument, timeframe="60"):
-        """Get OHLCV data"""
-        url = f"{DERIBIT_API}/public/get_tradingview_chart_data"
-        end_time = int(datetime.now().timestamp() * 1000)
-        start_time = int((datetime.now() - timedelta(hours=48)).timestamp() * 1000)
-        
-        params = {
-            "instrument_name": instrument,
-            "start_timestamp": start_time,
-            "end_timestamp": end_time,
-            "resolution": timeframe
-        }
-        
-        async with session.get(url, params=params) as response:
-            data = await response.json()
-            return data.get("result", {})
-    
-    async def fetch_options_summary(self, session, currency="BTC"):
-        """Get options chain summary"""
-        url = f"{DERIBIT_API}/public/get_book_summary_by_currency"
-        params = {"currency": currency, "kind": "option"}
-        
-        async with session.get(url, params=params) as response:
-            data = await response.json()
-            return data.get("result", [])
-    
-    async def fetch_funding_rate(self, session, instrument):
-        """Get funding rate"""
-        url = f"{DERIBIT_API}/public/get_funding_rate_history"
-        params = {"instrument_name": instrument, "count": 10}
-        
-        async with session.get(url, params=params) as response:
-            data = await response.json()
-            return data.get("result", [])
-    
-    async def fetch_ticker(self, session, instrument):
-        """Get ticker data"""
-        url = f"{DERIBIT_API}/public/ticker"
-        params = {"instrument_name": instrument}
-        
-        async with session.get(url, params=params) as response:
-            data = await response.json()
-            return data.get("result", {})
-
-class SmartMoneyAnalyzer:
-    """Analyze market data using Smart Money Concepts"""
-    
-    def detect_order_blocks(self, candles):
-        """Identify order block zones"""
-        order_blocks = []
-        
-        if not candles or len(candles.get("close", [])) < 5:
-            return order_blocks
-        
-        closes = candles["close"]
-        highs = candles["high"]
-        lows = candles["low"]
-        volumes = candles["volume"]
-        
-        for i in range(2, len(closes) - 2):
-            # Bullish Order Block
-            if (closes[i] > closes[i-1] and 
-                volumes[i] > np.mean(volumes[max(0, i-10):i]) * 1.5):
-                order_blocks.append({
-                    "type": "bullish",
-                    "zone_low": lows[i-1],
-                    "zone_high": highs[i-1],
-                    "strength": "high" if volumes[i] > np.mean(volumes) * 2 else "medium"
-                })
-            
-            # Bearish Order Block
-            if (closes[i] < closes[i-1] and 
-                volumes[i] > np.mean(volumes[max(0, i-10):i]) * 1.5):
-                order_blocks.append({
-                    "type": "bearish",
-                    "zone_low": lows[i-1],
-                    "zone_high": highs[i-1],
-                    "strength": "high" if volumes[i] > np.mean(volumes) * 2 else "medium"
-                })
-        
-        return order_blocks[-3:]  # Last 3 order blocks
-    
-    def detect_fvg(self, candles):
-        """Detect Fair Value Gaps"""
-        fvgs = []
-        
-        if not candles or len(candles.get("close", [])) < 3:
-            return fvgs
-        
-        highs = candles["high"]
-        lows = candles["low"]
-        
-        for i in range(1, len(highs) - 1):
-            # Bullish FVG
-            if lows[i+1] > highs[i-1]:
-                fvgs.append({
-                    "type": "bullish",
-                    "gap_low": highs[i-1],
-                    "gap_high": lows[i+1],
-                    "unfilled": True
-                })
-            
-            # Bearish FVG
-            if highs[i+1] < lows[i-1]:
-                fvgs.append({
-                    "type": "bearish",
-                    "gap_low": highs[i+1],
-                    "gap_high": lows[i-1],
-                    "unfilled": True
-                })
-        
-        return fvgs[-3:]  # Last 3 FVGs
-    
-    def analyze_liquidity(self, orderbook, trades):
-        """Analyze liquidity pools and sweeps"""
-        analysis = {
-            "bid_liquidity": 0,
-            "ask_liquidity": 0,
-            "imbalance": 0,
-            "large_trades": [],
-            "liquidation_likely": False
-        }
-        
-        if not orderbook:
-            return analysis
-        
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
-        
-        # Calculate liquidity
-        bid_volume = sum([bid[1] for bid in bids[:20]])
-        ask_volume = sum([ask[1] for ask in asks[:20]])
-        
-        analysis["bid_liquidity"] = bid_volume
-        analysis["ask_liquidity"] = ask_volume
-        analysis["imbalance"] = (bid_volume - ask_volume) / (bid_volume + ask_volume) if (bid_volume + ask_volume) > 0 else 0
-        
-        # Detect large trades (potential whale activity)
-        if trades:
-            avg_size = np.mean([t["amount"] for t in trades])
-            large_trades = [t for t in trades if t["amount"] > avg_size * 3]
-            analysis["large_trades"] = len(large_trades)
-        
-        return analysis
-    
-    def calculate_pcr(self, options_data):
-        """Calculate Put/Call Ratio"""
-        put_oi = 0
-        call_oi = 0
-        
-        for opt in options_data:
-            if "put" in opt.get("instrument_name", "").lower():
-                put_oi += opt.get("open_interest", 0)
-            elif "call" in opt.get("instrument_name", "").lower():
-                call_oi += opt.get("open_interest", 0)
-        
-        return put_oi / call_oi if call_oi > 0 else 0
-    
-    def analyze_market_structure(self, candles):
-        """Determine market structure"""
-        if not candles or len(candles.get("close", [])) < 10:
-            return "neutral"
-        
-        closes = candles["close"]
-        highs = candles["high"]
-        lows = candles["low"]
-        
-        recent_closes = closes[-10:]
-        
-        # Simple trend detection
-        if recent_closes[-1] > recent_closes[0] and recent_closes[-1] > np.mean(recent_closes):
-            return "bullish"
-        elif recent_closes[-1] < recent_closes[0] and recent_closes[-1] < np.mean(recent_closes):
-            return "bearish"
-        else:
-            return "neutral"
-
-class DeepSeekAI:
-    """Interact with DeepSeek V3 API"""
-    
-    async def analyze_market(self, market_data):
-        """Send data to DeepSeek for analysis"""
-        
-        prompt = f"""You are an expert Smart Money Concepts trader analyzing crypto markets.
-
-Market Data:
-{json.dumps(market_data, indent=2)}
-
-Analyze this data using Smart Money Concepts:
-1. Order Blocks - Are there valid institutional zones?
-2. Fair Value Gaps - Any unfilled imbalances?
-3. Liquidity Analysis - Where are stop hunts likely?
-4. Market Structure - Bullish/Bearish/Neutral?
-5. Put/Call Ratio - Institutional sentiment?
-6. Funding Rate - Overleveraged positions?
-
-Provide a trade recommendation ONLY if confidence is above 65%.
-
-Respond in this EXACT JSON format:
-{{
-  "signal": "BUY" or "SELL" or "NO_TRADE",
-  "instrument": "BTC-PERPETUAL" or "ETH-PERPETUAL",
-  "entry_price": number,
-  "stop_loss": number,
-  "target": number,
-  "confidence": number (0-100),
-  "reasoning": [
-    "reason 1",
-    "reason 2",
-    "reason 3"
-  ],
-  "risk_level": "LOW" or "MEDIUM" or "HIGH",
-  "timeframe": "1H" or "4H"
-}}
-
-Be strict - only generate signals when setup is clear and probability is high."""
-
-        headers = {
-            "Authorization": f"Bearer {DEEPSEEK_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "deepseek-chat",
-            "messages": [
-                {"role": "system", "content": "You are an expert crypto trader using Smart Money Concepts."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.3,
-            "max_tokens": 1000
-        }
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(DEEPSEEK_API, json=payload, headers=headers) as response:
-                    result = await response.json()
-                    
-                    if "choices" in result and len(result["choices"]) > 0:
-                        content = result["choices"][0]["message"]["content"]
-                        # Extract JSON from response
-                        start = content.find("{")
-                        end = content.rfind("}") + 1
-                        if start != -1 and end > start:
-                            return json.loads(content[start:end])
-                    
-                    return None
-        except Exception as e:
-            print(f"DeepSeek API Error: {e}")
-            return None
-
-class ChartGenerator:
-    """Generate trading charts"""
-    
-    def create_signal_chart(self, candles, signal_data):
-        """Create chart with signal markers"""
-        
-        if not candles or "close" not in candles:
-            return None
-        
-        # Create figure
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), 
-                                        gridspec_kw={'height_ratios': [3, 1]})
-        
-        times = [datetime.fromtimestamp(t/1000) for t in candles["ticks"]]
-        
-        # Candlestick chart
-        for i in range(len(times)):
-            color = 'green' if candles["close"][i] >= candles["open"][i] else 'red'
-            ax1.plot([times[i], times[i]], 
-                    [candles["low"][i], candles["high"][i]], 
-                    color=color, linewidth=1)
-            ax1.plot([times[i], times[i]], 
-                    [candles["open"][i], candles["close"][i]], 
-                    color=color, linewidth=4)
-        
-        # Mark entry, SL, target
-        if signal_data.get("signal") != "NO_TRADE":
-            entry = signal_data.get("entry_price")
-            sl = signal_data.get("stop_loss")
-            target = signal_data.get("target")
-            
-            ax1.axhline(y=entry, color='blue', linestyle='--', label=f'Entry: {entry}')
-            ax1.axhline(y=sl, color='red', linestyle='--', label=f'Stop Loss: {sl}')
-            ax1.axhline(y=target, color='green', linestyle='--', label=f'Target: {target}')
-        
-        ax1.set_title(f"{signal_data.get('instrument')} - {signal_data.get('signal')} Signal", 
-                     fontsize=16, fontweight='bold')
-        ax1.set_ylabel('Price (USD)', fontsize=12)
-        ax1.legend(loc='upper left')
-        ax1.grid(True, alpha=0.3)
-        
-        # Volume chart
-        colors = ['green' if candles["close"][i] >= candles["open"][i] else 'red' 
-                 for i in range(len(times))]
-        ax2.bar(times, candles["volume"], color=colors, alpha=0.5)
-        ax2.set_ylabel('Volume', fontsize=12)
-        ax2.set_xlabel('Time', fontsize=12)
-        ax2.grid(True, alpha=0.3)
-        
-        # Format x-axis
-        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        plt.xticks(rotation=45)
-        
-        plt.tight_layout()
-        
-        # Save to BytesIO
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-        buf.seek(0)
-        plt.close()
-        
-        return buf
-
-class TelegramNotifier:
-    """Send signals to Telegram"""
-    
-    async def send_signal(self, signal_data, chart_buffer):
-        """Send trade signal with chart"""
-        
-        if signal_data.get("signal") == "NO_TRADE":
-            return
-        
-        # Format message
-        message = f"""
-🚨 **SMART MONEY SIGNAL** 🚨
-
-**Instrument:** {signal_data['instrument']}
-**Signal:** {signal_data['signal']} {'🟢' if signal_data['signal'] == 'BUY' else '🔴'}
-**Confidence:** {signal_data['confidence']}%
-
-**Entry:** ${signal_data['entry_price']:,.2f}
-**Stop Loss:** ${signal_data['stop_loss']:,.2f}
-**Target:** ${signal_data['target']:,.2f}
-**Risk:** {signal_data['risk_level']}
-
-**Reasoning:**
-{chr(10).join([f"• {r}" for r in signal_data['reasoning']])}
-
-**Timeframe:** {signal_data['timeframe']}
-**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC
-
-⚠️ Always manage your risk!
+#!/usr/bin/env python3
 """
-        
-        try:
-            # Send chart
-            if chart_buffer:
-                await telegram_bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    photo=chart_buffer,
-                    caption=message,
-                    parse_mode='Markdown'
-                )
-            else:
-                await telegram_bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=message,
-                    parse_mode='Markdown'
-                )
-            
-            print(f"✅ Signal sent to Telegram: {signal_data['signal']} {signal_data['instrument']}")
-            
-        except TelegramError as e:
-            print(f"❌ Telegram Error: {e}")
+DELTA EXCHANGE TEST BOT
+========================
+BTC/ETH LTP + Option Chain Data every 1 minute
+Telegram Alert System
+"""
 
-class SmartMoneyBot:
-    """Main bot orchestrator"""
+import os
+import time
+import asyncio
+import requests
+from datetime import datetime
+from telegram import Bot
+import logging
+
+# ==================== CONFIGURATION ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Environment Variables
+DELTA_API_KEY = os.getenv('DELTA_API_KEY')
+DELTA_API_SECRET = os.getenv('DELTA_API_SECRET')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+# Delta Exchange API Base URL
+BASE_URL = "https://api.india.delta.exchange"
+
+# ==================== DELTA API CLIENT ====================
+class DeltaExchangeClient:
+    def __init__(self, api_key, api_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
     
-    def __init__(self):
-        self.fetcher = DeribitDataFetcher()
-        self.analyzer = SmartMoneyAnalyzer()
-        self.ai = DeepSeekAI()
-        self.chart_gen = ChartGenerator()
-        self.notifier = TelegramNotifier()
-    
-    async def collect_market_data(self, instrument):
-        """Collect all necessary data"""
-        
-        async with aiohttp.ClientSession() as session:
-            # Fetch all data concurrently
-            orderbook, trades, candles, funding, ticker = await asyncio.gather(
-                self.fetcher.fetch_orderbook(session, instrument),
-                self.fetcher.fetch_trades(session, instrument),
-                self.fetcher.fetch_candlesticks(session, instrument),
-                self.fetcher.fetch_funding_rate(session, instrument),
-                self.fetcher.fetch_ticker(session, instrument)
-            )
+    def get_products(self):
+        """Get all available products"""
+        try:
+            url = f"{BASE_URL}/v2/products"
+            response = requests.get(url, headers=self.headers, timeout=10)
             
-            # Get options data for currency
-            currency = "BTC" if "BTC" in instrument else "ETH"
-            options = await self.fetcher.fetch_options_summary(session, currency)
+            if response.status_code == 200:
+                return response.json().get('result', [])
+            else:
+                logger.error(f"❌ Products API failed: {response.status_code}")
+                return []
+        except Exception as e:
+            logger.error(f"❌ Get products error: {e}")
+            return []
+    
+    def get_ticker(self, symbol):
+        """Get LTP for a symbol"""
+        try:
+            url = f"{BASE_URL}/v2/tickers/{symbol}"
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json().get('result', {})
+                return {
+                    'symbol': data.get('symbol'),
+                    'mark_price': float(data.get('mark_price', 0)),
+                    'spot_price': float(data.get('spot_price', 0)),
+                    'volume': float(data.get('volume', 0)),
+                    'turnover_usd': float(data.get('turnover_usd', 0))
+                }
+            else:
+                logger.error(f"❌ Ticker API failed: {response.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"❌ Get ticker error: {e}")
+            return None
+    
+    def get_option_chain(self, underlying='BTC'):
+        """Get option chain for BTC/ETH"""
+        try:
+            # Get spot price first
+            spot_symbol = f"{underlying}USDT"
+            ticker = self.get_ticker(spot_symbol)
+            
+            if not ticker:
+                return None
+            
+            spot_price = ticker['spot_price']
+            atm_strike = self.round_to_strike(spot_price, underlying)
+            
+            # Get all products
+            all_products = self.get_products()
+            
+            # Filter options near ATM (±10 strikes)
+            options = []
+            strike_range = self.get_strike_range(atm_strike, underlying)
+            
+            for product in all_products:
+                if product.get('contract_type') != 'call_options' and product.get('contract_type') != 'put_options':
+                    continue
+                
+                # Check if product is for our underlying
+                if underlying not in product.get('symbol', ''):
+                    continue
+                
+                strike = product.get('strike_price')
+                if strike and float(strike) in strike_range:
+                    # Get orderbook for this option
+                    orderbook = self.get_orderbook(product['symbol'])
+                    
+                    option_data = {
+                        'symbol': product['symbol'],
+                        'strike': float(strike),
+                        'type': 'CE' if product['contract_type'] == 'call_options' else 'PE',
+                        'expiry': product.get('expiry_time', 'N/A'),
+                        'mark_price': float(product.get('mark_price', 0)),
+                        'open_interest': float(product.get('open_interest', 0)),
+                        'volume': float(product.get('volume', 0)),
+                        'best_bid': orderbook.get('best_bid', 0) if orderbook else 0,
+                        'best_ask': orderbook.get('best_ask', 0) if orderbook else 0
+                    }
+                    options.append(option_data)
             
             return {
-                "orderbook": orderbook,
-                "trades": trades,
-                "candles": candles,
-                "funding": funding,
-                "ticker": ticker,
-                "options": options
+                'underlying': underlying,
+                'spot_price': spot_price,
+                'atm_strike': atm_strike,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'options': sorted(options, key=lambda x: (x['strike'], x['type']))
             }
-    
-    def prepare_analysis_data(self, raw_data, instrument):
-        """Prepare data for AI analysis"""
-        
-        # Analyze using Smart Money concepts
-        order_blocks = self.analyzer.detect_order_blocks(raw_data["candles"])
-        fvgs = self.analyzer.detect_fvg(raw_data["candles"])
-        liquidity = self.analyzer.analyze_liquidity(raw_data["orderbook"], raw_data["trades"])
-        pcr = self.analyzer.calculate_pcr(raw_data["options"])
-        market_structure = self.analyzer.analyze_market_structure(raw_data["candles"])
-        
-        # Prepare data for AI
-        analysis_data = {
-            "instrument": instrument,
-            "current_price": raw_data["ticker"].get("last_price", 0),
-            "market_structure": market_structure,
-            "order_blocks": order_blocks,
-            "fair_value_gaps": fvgs,
-            "liquidity_analysis": {
-                "bid_liquidity": liquidity["bid_liquidity"],
-                "ask_liquidity": liquidity["ask_liquidity"],
-                "imbalance": liquidity["imbalance"],
-                "large_trades_count": liquidity["large_trades"]
-            },
-            "options_data": {
-                "put_call_ratio": round(pcr, 2),
-                "sentiment": "bullish" if pcr < 1 else "bearish" if pcr > 1 else "neutral"
-            },
-            "funding_rate": raw_data["funding"][0]["interest_8h"] if raw_data["funding"] else 0,
-            "volume_24h": raw_data["ticker"].get("stats", {}).get("volume", 0)
-        }
-        
-        return analysis_data
-    
-    async def analyze_and_signal(self, instrument):
-        """Complete analysis pipeline"""
-        
-        print(f"\n{'='*50}")
-        print(f"Analyzing {instrument}...")
-        print(f"{'='*50}\n")
-        
-        # Collect data
-        raw_data = await self.collect_market_data(instrument)
-        
-        # Store in Redis (cache for 30 mins)
-        cache_key = f"market_data:{instrument}"
-        redis_client.setex(cache_key, 1800, json.dumps(raw_data, default=str))
-        
-        # Prepare analysis
-        analysis_data = self.prepare_analysis_data(raw_data, instrument)
-        
-        print(f"Market Structure: {analysis_data['market_structure']}")
-        print(f"PCR: {analysis_data['options_data']['put_call_ratio']}")
-        print(f"Order Blocks: {len(analysis_data['order_blocks'])}")
-        print(f"FVGs: {len(analysis_data['fair_value_gaps'])}")
-        
-        # AI analysis
-        signal = await self.ai.analyze_market(analysis_data)
-        
-        if not signal:
-            print("❌ No signal generated (AI error)")
-            return
-        
-        print(f"\n🎯 Signal: {signal.get('signal')}")
-        print(f"📊 Confidence: {signal.get('confidence')}%")
-        
-        # Only send if confidence > 65%
-        if signal.get("confidence", 0) >= 65 and signal.get("signal") != "NO_TRADE":
-            # Generate chart
-            chart = self.chart_gen.create_signal_chart(raw_data["candles"], signal)
             
-            # Send to Telegram
-            await self.notifier.send_signal(signal, chart)
+        except Exception as e:
+            logger.error(f"❌ Get option chain error: {e}")
+            return None
+    
+    def get_orderbook(self, symbol):
+        """Get orderbook for a symbol"""
+        try:
+            url = f"{BASE_URL}/v2/l2orderbook/{symbol}"
+            response = requests.get(url, headers=self.headers, timeout=10)
             
-            # Store signal in Redis
-            signal_key = f"signal:{instrument}:{int(datetime.now().timestamp())}"
-            redis_client.setex(signal_key, 86400, json.dumps(signal))  # 24h expiry
-        else:
-            print("⚠️ Signal confidence too low or NO_TRADE")
+            if response.status_code == 200:
+                data = response.json().get('result', {})
+                buy = data.get('buy', [])
+                sell = data.get('sell', [])
+                
+                return {
+                    'best_bid': float(buy[0]['price']) if buy else 0,
+                    'best_ask': float(sell[0]['price']) if sell else 0
+                }
+            return None
+        except Exception as e:
+            logger.error(f"❌ Orderbook error: {e}")
+            return None
     
-    async def run_cycle(self):
-        """Run one analysis cycle"""
-        
-        print(f"\n🚀 Starting analysis cycle at {datetime.now()}")
-        
-        for instrument in INSTRUMENTS:
-            try:
-                await self.analyze_and_signal(instrument)
-                await asyncio.sleep(5)  # Small delay between instruments
-            except Exception as e:
-                print(f"❌ Error analyzing {instrument}: {e}")
-        
-        print(f"\n✅ Cycle completed at {datetime.now()}")
-        print("⏰ Next run in 30 minutes...\n")
+    def round_to_strike(self, price, underlying):
+        """Round price to nearest strike"""
+        if underlying == 'BTC':
+            # BTC strikes in 1000s (e.g., 95000, 96000)
+            return round(price / 1000) * 1000
+        else:  # ETH
+            # ETH strikes in 100s (e.g., 3400, 3500)
+            return round(price / 100) * 100
     
-    async def start(self):
-        """Main bot loop"""
+    def get_strike_range(self, atm_strike, underlying):
+        """Get ±10 strikes around ATM"""
+        if underlying == 'BTC':
+            step = 1000
+        else:  # ETH
+            step = 100
         
-        print("="*60)
-        print("🤖 SMART MONEY BOT STARTED")
-        print("="*60)
-        print(f"Monitoring: {', '.join(INSTRUMENTS)}")
-        print(f"Analysis Interval: Every 30 minutes")
-        print(f"AI Model: DeepSeek V3")
-        print("="*60)
+        strikes = []
+        for i in range(-10, 11):
+            strikes.append(atm_strike + (i * step))
+        return strikes
+
+# ==================== TELEGRAM FORMATTER ====================
+class TelegramFormatter:
+    @staticmethod
+    def format_option_chain_message(chain_data):
+        """Format option chain data for Telegram"""
+        if not chain_data:
+            return "❌ No data available"
+        
+        underlying = chain_data['underlying']
+        spot = chain_data['spot_price']
+        atm = chain_data['atm_strike']
+        timestamp = chain_data['timestamp']
+        options = chain_data['options']
+        
+        # Header
+        message = f"""
+🔔 {underlying} OPTION CHAIN UPDATE
+
+📊 Spot Price: ${spot:,.2f}
+🎯 ATM Strike: ${atm:,.0f}
+🕐 Time: {timestamp}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        # Separate CE and PE
+        ce_options = [opt for opt in options if opt['type'] == 'CE']
+        pe_options = [opt for opt in options if opt['type'] == 'PE']
+        
+        # Group by strike
+        strikes = sorted(list(set([opt['strike'] for opt in options])))
+        
+        message += "\n📈 CALL OPTIONS (CE):\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        
+        for strike in strikes:
+            ce = next((opt for opt in ce_options if opt['strike'] == strike), None)
+            
+            if ce:
+                mark = "🎯" if strike == atm else "  "
+                message += f"\n{mark} Strike: ${ce['strike']:,.0f}\n"
+                message += f"   Premium: ${ce['mark_price']:.2f}\n"
+                message += f"   OI: {ce['open_interest']:,.0f}\n"
+                message += f"   Vol: {ce['volume']:,.0f}\n"
+                message += f"   Bid/Ask: ${ce['best_bid']:.2f}/${ce['best_ask']:.2f}\n"
+        
+        message += "\n\n📉 PUT OPTIONS (PE):\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        
+        for strike in strikes:
+            pe = next((opt for opt in pe_options if opt['strike'] == strike), None)
+            
+            if pe:
+                mark = "🎯" if strike == atm else "  "
+                message += f"\n{mark} Strike: ${pe['strike']:,.0f}\n"
+                message += f"   Premium: ${pe['mark_price']:.2f}\n"
+                message += f"   OI: {pe['open_interest']:,.0f}\n"
+                message += f"   Vol: {pe['volume']:,.0f}\n"
+                message += f"   Bid/Ask: ${pe['best_bid']:.2f}/${pe['best_ask']:.2f}\n"
+        
+        message += "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        message += "⚡ Delta Exchange India\n"
+        
+        return message
+
+# ==================== MAIN BOT ====================
+class DeltaTestBot:
+    def __init__(self):
+        self.client = DeltaExchangeClient(DELTA_API_KEY, DELTA_API_SECRET)
+        self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        self.formatter = TelegramFormatter()
+    
+    async def send_telegram_message(self, message):
+        """Send message to Telegram"""
+        try:
+            # Split long messages
+            max_length = 4096
+            if len(message) > max_length:
+                # Send in parts
+                parts = [message[i:i+max_length] for i in range(0, len(message), max_length)]
+                for part in parts:
+                    await self.telegram_bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID,
+                        text=part,
+                        parse_mode='HTML'
+                    )
+                    await asyncio.sleep(1)  # Avoid rate limit
+            else:
+                await self.telegram_bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=message,
+                    parse_mode='HTML'
+                )
+            logger.info("✅ Message sent to Telegram")
+        except Exception as e:
+            logger.error(f"❌ Telegram error: {e}")
+    
+    async def fetch_and_send_data(self, underlying):
+        """Fetch option chain and send to Telegram"""
+        try:
+            logger.info(f"🔍 Fetching {underlying} data...")
+            
+            # Get option chain
+            chain_data = self.client.get_option_chain(underlying)
+            
+            if chain_data:
+                # Format message
+                message = self.formatter.format_option_chain_message(chain_data)
+                
+                # Send to Telegram
+                await self.send_telegram_message(message)
+            else:
+                logger.warning(f"⚠️ No data for {underlying}")
+                
+        except Exception as e:
+            logger.error(f"❌ Fetch error: {e}")
+    
+    async def run(self):
+        """Main loop - fetch every 1 minute"""
+        logger.info("="*50)
+        logger.info("🚀 DELTA EXCHANGE TEST BOT STARTED")
+        logger.info("="*50)
         
         # Send startup message
-        try:
-            await telegram_bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text="🤖 Smart Money Bot is now ACTIVE! 🚀\n\nMonitoring BTC & ETH markets...",
-                parse_mode='Markdown'
-            )
-        except:
-            pass
+        startup_msg = """
+🚀 DELTA TEST BOT STARTED
+
+📊 Monitoring: BTC & ETH
+⏱️ Interval: 1 minute
+📡 Data: LTP + Option Chain (ATM ±10)
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+⚡ Status: 🟢 ACTIVE
+"""
+        await self.send_telegram_message(startup_msg)
         
         while True:
             try:
-                await self.run_cycle()
-                await asyncio.sleep(1800)  # 30 minutes
+                # Fetch BTC data
+                await self.fetch_and_send_data('BTC')
+                await asyncio.sleep(5)  # Wait 5 sec between BTC and ETH
+                
+                # Fetch ETH data
+                await self.fetch_and_send_data('ETH')
+                
+                # Wait 1 minute before next cycle
+                logger.info("⏳ Waiting 1 minute for next update...\n")
+                await asyncio.sleep(55)  # 55 + 5 = 60 seconds total
+                
             except KeyboardInterrupt:
-                print("\n⚠️ Bot stopped by user")
+                logger.info("🛑 Bot stopped by user")
                 break
             except Exception as e:
-                print(f"❌ Critical error: {e}")
-                await asyncio.sleep(60)  # Wait 1 min before retry
+                logger.error(f"❌ Main loop error: {e}")
+                await asyncio.sleep(60)
 
+# ==================== ENTRY POINT ====================
 if __name__ == "__main__":
-    bot = SmartMoneyBot()
-    asyncio.run(bot.start())
+    # Validate environment variables
+    if not all([DELTA_API_KEY, DELTA_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+        logger.error("❌ Missing environment variables!")
+        logger.error("Required: DELTA_API_KEY, DELTA_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+        exit(1)
+    
+    try:
+        bot = DeltaTestBot()
+        asyncio.run(bot.run())
+    except Exception as e:
+        logger.error(f"💥 Fatal error: {e}")
