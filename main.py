@@ -2,8 +2,9 @@
 """
 DELTA EXCHANGE OPTION CHAIN BOT
 ================================
-Professional Option Chain Data with Bid/Ask/Mark/OI/Volume
-Telegram Alert System - Every 1 Minute
+Auto-selects NEAREST ACTIVE EXPIRY
+Switches to next expiry after current expires
+Daily expiries at 5:30 PM IST
 """
 
 import os
@@ -35,6 +36,7 @@ class DeltaExchangeClient:
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         }
+        self.cached_expiries = {}  # Cache expiries per underlying
     
     def get_ticker(self, symbol):
         """Get ticker for a symbol"""
@@ -51,8 +53,83 @@ class DeltaExchangeClient:
             logger.error(f"❌ Ticker error {symbol}: {e}")
             return None
     
+    def get_available_expiries(self, underlying='BTC'):
+        """Get all available expiry dates for an underlying"""
+        try:
+            url = f"{BASE_URL}/v2/products"
+            params = {
+                'contract_types': 'call_options',
+                'states': 'live'
+            }
+            
+            response = requests.get(url, headers=self.headers, params=params, timeout=10)
+            
+            if response.status_code != 200:
+                return []
+            
+            json_data = response.json()
+            if not json_data.get('success'):
+                return []
+            
+            products = json_data.get('result', [])
+            
+            # Extract unique expiry dates for this underlying
+            expiries = set()
+            for product in products:
+                symbol = product.get('symbol', '')
+                if underlying in symbol and product.get('settlement_time'):
+                    settlement_time = product.get('settlement_time')
+                    # Parse settlement time: "2025-11-17T12:00:00Z"
+                    try:
+                        expiry_dt = datetime.strptime(settlement_time, '%Y-%m-%dT%H:%M:%SZ')
+                        expiry_date = expiry_dt.strftime('%d-%m-%Y')
+                        expiries.add(expiry_date)
+                    except:
+                        continue
+            
+            # Sort expiries by date
+            sorted_expiries = sorted(list(expiries), key=lambda x: datetime.strptime(x, '%d-%m-%Y'))
+            
+            logger.info(f"📅 Found {len(sorted_expiries)} expiries for {underlying}")
+            return sorted_expiries
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting expiries: {e}")
+            return []
+    
+    def get_nearest_active_expiry(self, underlying='BTC'):
+        """Get nearest active expiry that hasn't expired yet"""
+        try:
+            expiries = self.get_available_expiries(underlying)
+            
+            if not expiries:
+                logger.warning(f"⚠️ No expiries found for {underlying}")
+                return None
+            
+            # IST timezone - options expire at 5:30 PM IST
+            now = datetime.now()
+            
+            # Find first expiry that is today or in future
+            for expiry_str in expiries:
+                expiry_dt = datetime.strptime(expiry_str, '%d-%m-%Y')
+                # Set expiry time to 5:30 PM (17:30)
+                expiry_dt = expiry_dt.replace(hour=17, minute=30)
+                
+                # If expiry is in future, use it
+                if expiry_dt > now:
+                    logger.info(f"✅ Selected nearest expiry: {expiry_str} for {underlying}")
+                    return expiry_str
+            
+            # If no future expiry found, return first available (shouldn't happen)
+            logger.warning(f"⚠️ All expiries expired, using first: {expiries[0]}")
+            return expiries[0]
+            
+        except Exception as e:
+            logger.error(f"❌ Error finding nearest expiry: {e}")
+            return None
+    
     def get_option_chain_detailed(self, underlying='BTC', expiry_date=None):
-        """Get detailed option chain with all data"""
+        """Get detailed option chain with auto-expiry selection"""
         try:
             # Get perpetual futures price
             perp_symbol = f"{underlying}USD"
@@ -68,16 +145,14 @@ class DeltaExchangeClient:
                 logger.warning(f"⚠️ Price is 0 for {underlying}")
                 return None
             
-            # Auto-calculate next Friday if no expiry provided
+            # Auto-select nearest expiry if not provided
             if not expiry_date:
-                today = datetime.now()
-                days_until_friday = (4 - today.weekday()) % 7
-                if days_until_friday == 0:
-                    days_until_friday = 7
-                next_friday = today + timedelta(days=days_until_friday)
-                expiry_date = next_friday.strftime('%d-%m-%Y')
+                expiry_date = self.get_nearest_active_expiry(underlying)
+                if not expiry_date:
+                    logger.error(f"❌ No active expiry for {underlying}")
+                    return None
             
-            # Fetch option chain
+            # Fetch option chain for this expiry
             url = f"{BASE_URL}/v2/tickers"
             params = {
                 'contract_types': 'call_options,put_options',
@@ -85,7 +160,7 @@ class DeltaExchangeClient:
                 'expiry_date': expiry_date
             }
             
-            logger.info(f"📡 Fetching {underlying} options for {expiry_date}")
+            logger.info(f"📡 Fetching {underlying} options for expiry: {expiry_date}")
             
             response = requests.get(url, headers=self.headers, params=params, timeout=10)
             
@@ -108,8 +183,8 @@ class DeltaExchangeClient:
             # Calculate ATM
             atm_strike = self.round_to_strike(spot_price, underlying)
             
-            # Get strike range (ATM ±10 strikes)
-            strike_range = self.get_strike_range(atm_strike, underlying, count=10)
+            # Get strike range (ATM ±8 strikes for better display)
+            strike_range = self.get_strike_range(atm_strike, underlying, count=8)
             
             # Parse options data
             calls = {}
@@ -182,7 +257,7 @@ class DeltaExchangeClient:
         else:  # ETH
             return round(price / 100) * 100
     
-    def get_strike_range(self, atm_strike, underlying, count=10):
+    def get_strike_range(self, atm_strike, underlying, count=8):
         """Get ±count strikes around ATM"""
         if underlying == 'BTC':
             step = 1000
@@ -216,14 +291,23 @@ class TelegramFormatter:
         calls = chain_data['calls']
         puts = chain_data['puts']
         
-        # Calculate time to expiry
+        # Calculate time to expiry (IST - expires at 5:30 PM)
         try:
             expiry_dt = datetime.strptime(expiry, '%d-%m-%Y')
+            expiry_dt = expiry_dt.replace(hour=17, minute=30)  # 5:30 PM IST
             now = datetime.now()
             delta = expiry_dt - now
-            days = delta.days
-            hours = delta.seconds // 3600
-            tte = f"{days}d:{hours}h"
+            
+            if delta.total_seconds() < 0:
+                tte = "EXPIRED"
+            else:
+                days = delta.days
+                hours = delta.seconds // 3600
+                minutes = (delta.seconds % 3600) // 60
+                if days > 0:
+                    tte = f"{days}d {hours}h"
+                else:
+                    tte = f"{hours}h {minutes}m"
         except:
             tte = "N/A"
         
@@ -233,8 +317,8 @@ class TelegramFormatter:
 
 💰 Spot: <b>${spot:,.2f}</b>
 🎯 ATM: <b>${atm:,.0f}</b>
-📅 Expiry: {expiry}
-⏰ TTE: {tte}
+📅 Expiry: <b>{expiry}</b>
+⏰ TTE: <b>{tte}</b>
 🕐 {timestamp}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -247,9 +331,9 @@ class TelegramFormatter:
             message += "\n⚠️ No options data available\n"
             return message
         
-        # Table format
-        message += "\n<b>CALLS                    |   PUTS</b>\n"
-        message += "<code>Strike  | Bid   Ask  OI     | Bid   Ask  OI</code>\n"
+        # Table header
+        message += "\n<b>   CALLS            |    PUTS</b>\n"
+        message += "<code>Bid  Ask  OI   | Bid  Ask  OI</code>\n"
         message += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
         for strike in all_strikes:
@@ -263,38 +347,42 @@ class TelegramFormatter:
                 indicator = "  "
             
             # Format strike
-            strike_str = f"${strike:,.0f}"
+            if underlying == 'BTC':
+                strike_str = f"${strike/1000:.0f}K"
+            else:
+                strike_str = f"${strike:,.0f}"
             
             # Call side
             if call:
-                call_bid = f"${call.get('bid', 0):.1f}"
-                call_ask = f"${call.get('ask', 0):.1f}"
-                call_oi = self.format_large_number(call.get('oi', 0))
-                call_line = f"{call_bid:>6} {call_ask:>6} {call_oi:>5}"
+                c_bid = f"{call.get('bid', 0):.0f}" if call.get('bid', 0) > 0 else "-"
+                c_ask = f"{call.get('ask', 0):.0f}" if call.get('ask', 0) > 0 else "-"
+                c_oi = self.format_large_number(call.get('oi', 0))
+                call_line = f"{c_bid:>4} {c_ask:>4} {c_oi:>4}"
             else:
-                call_line = "   -      -     -  "
+                call_line = "  -    -    -"
             
             # Put side
             if put:
-                put_bid = f"${put.get('bid', 0):.1f}"
-                put_ask = f"${put.get('ask', 0):.1f}"
-                put_oi = self.format_large_number(put.get('oi', 0))
-                put_line = f"{put_bid:>6} {put_ask:>6} {put_oi:>5}"
+                p_bid = f"{put.get('bid', 0):.0f}" if put.get('bid', 0) > 0 else "-"
+                p_ask = f"{put.get('ask', 0):.0f}" if put.get('ask', 0) > 0 else "-"
+                p_oi = self.format_large_number(put.get('oi', 0))
+                put_line = f"{p_bid:>4} {p_ask:>4} {p_oi:>4}"
             else:
-                put_line = "   -      -     -  "
+                put_line = "  -    -    -"
             
-            message += f"<code>{indicator}{strike_str:>8} | {call_line} | {put_line}</code>\n"
+            message += f"<code>{call_line} | {put_line}</code> {indicator}{strike_str}\n"
         
         message += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         
         # Summary stats
         total_call_oi = sum(c.get('oi', 0) for c in calls.values())
         total_put_oi = sum(p.get('oi', 0) for p in puts.values())
+        pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
         
         message += f"\n📊 <b>Summary</b>\n"
         message += f"Call OI: {self.format_large_number(total_call_oi)}\n"
         message += f"Put OI: {self.format_large_number(total_put_oi)}\n"
-        message += f"PCR: {(total_put_oi/total_call_oi if total_call_oi > 0 else 0):.2f}\n"
+        message += f"PCR: <b>{pcr:.2f}</b>\n"
         
         message += "\n⚡ <i>Delta Exchange India</i>"
         
@@ -335,6 +423,7 @@ class DeltaOptionBot:
         try:
             logger.info(f"🔍 Fetching {underlying}...")
             
+            # Auto-selects nearest active expiry
             chain_data = self.client.get_option_chain_detailed(underlying)
             
             if chain_data:
@@ -350,7 +439,7 @@ class DeltaOptionBot:
     async def run(self):
         """Main loop"""
         logger.info("="*50)
-        logger.info("🚀 DELTA OPTION CHAIN BOT STARTED")
+        logger.info("🚀 DELTA OPTION CHAIN BOT - AUTO EXPIRY")
         logger.info("="*50)
         
         startup_msg = """
@@ -358,10 +447,11 @@ class DeltaOptionBot:
 
 📊 Assets: BTC & ETH
 ⏱️ Interval: 1 minute
-📈 Data: Full Option Chain
-   • Bid/Ask Prices
-   • Open Interest
-   • Strike-wise Analysis
+📈 Features:
+   • Auto nearest expiry selection
+   • Auto-switch after expiry (5:30 PM IST)
+   • Full option chain data
+   • Bid/Ask/OI/Volume
    • PCR Ratio
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
