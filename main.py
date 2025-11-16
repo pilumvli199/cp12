@@ -47,9 +47,16 @@ class DeltaExchangeClient:
             response = requests.get(url, headers=self.headers, timeout=10)
             
             if response.status_code == 200:
-                return response.json().get('result', [])
+                json_data = response.json()
+                
+                # Check if response is successful
+                if not json_data.get('success'):
+                    logger.error(f"❌ Products API returned unsuccessful response")
+                    return []
+                
+                return json_data.get('result', [])
             else:
-                logger.error(f"❌ Products API failed: {response.status_code}")
+                logger.error(f"❌ Products API failed: {response.status_code} - {response.text}")
                 return []
         except Exception as e:
             logger.error(f"❌ Get products error: {e}")
@@ -62,62 +69,89 @@ class DeltaExchangeClient:
             response = requests.get(url, headers=self.headers, timeout=10)
             
             if response.status_code == 200:
-                data = response.json().get('result', {})
+                json_data = response.json()
+                
+                # Check if response is successful
+                if not json_data.get('success'):
+                    logger.error(f"❌ Ticker API returned unsuccessful response for {symbol}")
+                    return None
+                
+                data = json_data.get('result', {})
+                if not data:
+                    logger.error(f"❌ No result data in ticker response for {symbol}")
+                    return None
+                
                 return {
-                    'symbol': data.get('symbol'),
+                    'symbol': data.get('symbol', symbol),
                     'mark_price': float(data.get('mark_price', 0)),
                     'spot_price': float(data.get('spot_price', 0)),
                     'volume': float(data.get('volume', 0)),
                     'turnover_usd': float(data.get('turnover_usd', 0))
                 }
             else:
-                logger.error(f"❌ Ticker API failed: {response.status_code}")
+                logger.error(f"❌ Ticker API failed for {symbol}: {response.status_code} - {response.text}")
                 return None
         except Exception as e:
-            logger.error(f"❌ Get ticker error: {e}")
+            logger.error(f"❌ Get ticker error for {symbol}: {e}")
             return None
     
     def get_option_chain(self, underlying='BTC'):
         """Get option chain for BTC/ETH"""
         try:
             # Get spot price first
-            spot_symbol = f"{underlying}USDT"
+            spot_symbol = f"{underlying}USD"
             ticker = self.get_ticker(spot_symbol)
             
             if not ticker:
+                logger.warning(f"⚠️ Could not get ticker for {spot_symbol}")
                 return None
             
-            spot_price = ticker['spot_price']
+            spot_price = ticker.get('spot_price') or ticker.get('mark_price', 0)
+            
+            if spot_price == 0:
+                logger.warning(f"⚠️ Spot price is 0 for {underlying}")
+                return None
+            
             atm_strike = self.round_to_strike(spot_price, underlying)
             
             # Get all products
             all_products = self.get_products()
+            
+            if not all_products:
+                logger.warning(f"⚠️ No products found")
+                return None
             
             # Filter options near ATM (±10 strikes)
             options = []
             strike_range = self.get_strike_range(atm_strike, underlying)
             
             for product in all_products:
-                if product.get('contract_type') != 'call_options' and product.get('contract_type') != 'put_options':
+                contract_type = product.get('contract_type', '')
+                
+                if contract_type not in ['call_options', 'put_options']:
                     continue
                 
                 # Check if product is for our underlying
-                if underlying not in product.get('symbol', ''):
+                symbol = product.get('symbol', '')
+                if underlying not in symbol:
                     continue
                 
                 strike = product.get('strike_price')
                 if strike and float(strike) in strike_range:
+                    # Get ticker for this option
+                    option_ticker = self.get_ticker(symbol)
+                    
                     # Get orderbook for this option
-                    orderbook = self.get_orderbook(product['symbol'])
+                    orderbook = self.get_orderbook(symbol)
                     
                     option_data = {
-                        'symbol': product['symbol'],
+                        'symbol': symbol,
                         'strike': float(strike),
-                        'type': 'CE' if product['contract_type'] == 'call_options' else 'PE',
-                        'expiry': product.get('expiry_time', 'N/A'),
-                        'mark_price': float(product.get('mark_price', 0)),
-                        'open_interest': float(product.get('open_interest', 0)),
-                        'volume': float(product.get('volume', 0)),
+                        'type': 'CE' if contract_type == 'call_options' else 'PE',
+                        'expiry': product.get('settlement_time', 'N/A'),
+                        'mark_price': float(product.get('mark_price', 0)) if product.get('mark_price') else 0,
+                        'open_interest': float(option_ticker.get('oi', 0)) if option_ticker else 0,
+                        'volume': float(option_ticker.get('volume', 0)) if option_ticker else 0,
                         'best_bid': orderbook.get('best_bid', 0) if orderbook else 0,
                         'best_ask': orderbook.get('best_ask', 0) if orderbook else 0
                     }
@@ -132,7 +166,7 @@ class DeltaExchangeClient:
             }
             
         except Exception as e:
-            logger.error(f"❌ Get option chain error: {e}")
+            logger.error(f"❌ Get option chain error for {underlying}: {e}")
             return None
     
     def get_orderbook(self, symbol):
@@ -142,7 +176,16 @@ class DeltaExchangeClient:
             response = requests.get(url, headers=self.headers, timeout=10)
             
             if response.status_code == 200:
-                data = response.json().get('result', {})
+                json_data = response.json()
+                
+                # Check if response is successful
+                if not json_data.get('success'):
+                    return None
+                
+                data = json_data.get('result', {})
+                if not data:
+                    return None
+                
                 buy = data.get('buy', [])
                 sell = data.get('sell', [])
                 
@@ -152,7 +195,6 @@ class DeltaExchangeClient:
                 }
             return None
         except Exception as e:
-            logger.error(f"❌ Orderbook error: {e}")
             return None
     
     def round_to_strike(self, price, underlying):
@@ -201,6 +243,10 @@ class TelegramFormatter:
 ━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
+        if not options:
+            message += "\n⚠️ No options data available\n"
+            return message
+        
         # Separate CE and PE
         ce_options = [opt for opt in options if opt['type'] == 'CE']
         pe_options = [opt for opt in options if opt['type'] == 'PE']
@@ -211,7 +257,7 @@ class TelegramFormatter:
         message += "\n📈 CALL OPTIONS (CE):\n"
         message += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         
-        for strike in strikes:
+        for strike in strikes[:5]:  # Show only top 5 strikes
             ce = next((opt for opt in ce_options if opt['strike'] == strike), None)
             
             if ce:
@@ -220,12 +266,13 @@ class TelegramFormatter:
                 message += f"   Premium: ${ce['mark_price']:.2f}\n"
                 message += f"   OI: {ce['open_interest']:,.0f}\n"
                 message += f"   Vol: {ce['volume']:,.0f}\n"
-                message += f"   Bid/Ask: ${ce['best_bid']:.2f}/${ce['best_ask']:.2f}\n"
+                if ce['best_bid'] > 0 or ce['best_ask'] > 0:
+                    message += f"   Bid/Ask: ${ce['best_bid']:.2f}/${ce['best_ask']:.2f}\n"
         
         message += "\n\n📉 PUT OPTIONS (PE):\n"
         message += "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         
-        for strike in strikes:
+        for strike in strikes[:5]:  # Show only top 5 strikes
             pe = next((opt for opt in pe_options if opt['strike'] == strike), None)
             
             if pe:
@@ -234,7 +281,8 @@ class TelegramFormatter:
                 message += f"   Premium: ${pe['mark_price']:.2f}\n"
                 message += f"   OI: {pe['open_interest']:,.0f}\n"
                 message += f"   Vol: {pe['volume']:,.0f}\n"
-                message += f"   Bid/Ask: ${pe['best_bid']:.2f}/${pe['best_ask']:.2f}\n"
+                if pe['best_bid'] > 0 or pe['best_ask'] > 0:
+                    message += f"   Bid/Ask: ${pe['best_bid']:.2f}/${pe['best_ask']:.2f}\n"
         
         message += "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         message += "⚡ Delta Exchange India\n"
@@ -259,15 +307,13 @@ class DeltaTestBot:
                 for part in parts:
                     await self.telegram_bot.send_message(
                         chat_id=TELEGRAM_CHAT_ID,
-                        text=part,
-                        parse_mode='HTML'
+                        text=part
                     )
                     await asyncio.sleep(1)  # Avoid rate limit
             else:
                 await self.telegram_bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
-                    text=message,
-                    parse_mode='HTML'
+                    text=message
                 )
             logger.info("✅ Message sent to Telegram")
         except Exception as e:
@@ -291,7 +337,7 @@ class DeltaTestBot:
                 logger.warning(f"⚠️ No data for {underlying}")
                 
         except Exception as e:
-            logger.error(f"❌ Fetch error: {e}")
+            logger.error(f"❌ Fetch error for {underlying}: {e}")
     
     async def run(self):
         """Main loop - fetch every 1 minute"""
@@ -335,9 +381,9 @@ class DeltaTestBot:
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     # Validate environment variables
-    if not all([DELTA_API_KEY, DELTA_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
         logger.error("❌ Missing environment variables!")
-        logger.error("Required: DELTA_API_KEY, DELTA_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+        logger.error("Required: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
         exit(1)
     
     try:
