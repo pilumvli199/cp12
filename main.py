@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-DELTA EXCHANGE TEST BOT
-========================
-BTC/ETH LTP + Option Chain Data every 1 minute
-Telegram Alert System
+DELTA EXCHANGE OPTION CHAIN BOT
+================================
+Professional Option Chain Data with Bid/Ask/Mark/OI/Volume
+Telegram Alert System - Every 1 Minute
 """
 
 import os
 import time
 import asyncio
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Bot
 import logging
 
@@ -37,47 +37,24 @@ class DeltaExchangeClient:
         }
     
     def get_ticker(self, symbol):
-        """Get ticker for a symbol with timeout"""
+        """Get ticker for a symbol"""
         try:
             url = f"{BASE_URL}/v2/tickers/{symbol}"
             response = requests.get(url, headers=self.headers, timeout=5)
             
             if response.status_code == 200:
                 json_data = response.json()
-                
-                if not json_data.get('success'):
-                    logger.error(f"❌ Ticker API unsuccessful for {symbol}")
-                    return None
-                
-                data = json_data.get('result', {})
-                if not data:
-                    logger.error(f"❌ No data for {symbol}")
-                    return None
-                
-                return {
-                    'symbol': data.get('symbol', symbol),
-                    'mark_price': float(data.get('mark_price', 0)),
-                    'spot_price': float(data.get('spot_price', 0)),
-                    'close': float(data.get('close', 0)),
-                    'volume': float(data.get('volume', 0)),
-                    'turnover_usd': float(data.get('turnover_usd', 0)),
-                    'oi': data.get('oi', 0)
-                }
-            else:
-                logger.error(f"❌ Ticker failed {symbol}: {response.status_code}")
-                return None
-                
-        except requests.exceptions.Timeout:
-            logger.error(f"⏱️ Timeout for {symbol}")
+                if json_data.get('success'):
+                    return json_data.get('result', {})
             return None
         except Exception as e:
             logger.error(f"❌ Ticker error {symbol}: {e}")
             return None
     
-    def get_option_chain_simple(self, underlying='BTC', expiry_date=None):
-        """Get option chain using tickers API - faster method"""
+    def get_option_chain_detailed(self, underlying='BTC', expiry_date=None):
+        """Get detailed option chain with all data"""
         try:
-            # Get perpetual futures price first
+            # Get perpetual futures price
             perp_symbol = f"{underlying}USD"
             ticker = self.get_ticker(perp_symbol)
             
@@ -85,17 +62,14 @@ class DeltaExchangeClient:
                 logger.warning(f"⚠️ No ticker for {perp_symbol}")
                 return None
             
-            # Use mark_price or close price
-            spot_price = ticker.get('mark_price') or ticker.get('close', 0)
+            spot_price = float(ticker.get('mark_price', 0) or ticker.get('close', 0))
             
             if spot_price == 0:
                 logger.warning(f"⚠️ Price is 0 for {underlying}")
                 return None
             
-            # If no expiry provided, get tickers for all options
+            # Auto-calculate next Friday if no expiry provided
             if not expiry_date:
-                # Get current or nearest weekly expiry (Friday)
-                from datetime import datetime, timedelta
                 today = datetime.now()
                 days_until_friday = (4 - today.weekday()) % 7
                 if days_until_friday == 0:
@@ -111,7 +85,7 @@ class DeltaExchangeClient:
                 'expiry_date': expiry_date
             }
             
-            logger.info(f"📡 Fetching options for {underlying} expiry {expiry_date}")
+            logger.info(f"📡 Fetching {underlying} options for {expiry_date}")
             
             response = requests.get(url, headers=self.headers, params=params, timeout=10)
             
@@ -128,51 +102,55 @@ class DeltaExchangeClient:
             options_data = json_data.get('result', [])
             
             if not options_data:
-                logger.warning(f"⚠️ No options data for {underlying} on {expiry_date}")
+                logger.warning(f"⚠️ No options for {underlying} on {expiry_date}")
                 return None
             
             # Calculate ATM
             atm_strike = self.round_to_strike(spot_price, underlying)
             
-            # Filter options near ATM (±5 strikes for telegram message limit)
-            strike_range = self.get_strike_range(atm_strike, underlying, count=5)
+            # Get strike range (ATM ±10 strikes)
+            strike_range = self.get_strike_range(atm_strike, underlying, count=10)
             
-            options = []
+            # Parse options data
+            calls = {}
+            puts = {}
+            
             for opt in options_data:
-                strike = opt.get('strike_price')
-                if not strike:
-                    continue
-                
                 try:
-                    strike_float = float(strike)
-                except (ValueError, TypeError):
-                    continue
+                    strike = opt.get('strike_price')
+                    if not strike:
+                        continue
                     
-                if strike_float not in strike_range:
-                    continue
-                
-                # Safe float conversion with defaults
-                try:
-                    mark_price = float(opt.get('mark_price', 0)) if opt.get('mark_price') else 0
-                    oi = float(opt.get('oi', 0)) if opt.get('oi') else 0
-                    volume = float(opt.get('volume', 0)) if opt.get('volume') else 0
+                    strike_float = float(strike)
+                    if strike_float not in strike_range:
+                        continue
+                    
+                    symbol = opt.get('symbol', '')
+                    is_call = 'C-' in symbol
+                    
                     quotes = opt.get('quotes', {})
-                    best_bid = float(quotes.get('best_bid', 0)) if quotes.get('best_bid') else 0
-                    best_ask = float(quotes.get('best_ask', 0)) if quotes.get('best_ask') else 0
-                except (ValueError, TypeError):
+                    
+                    option_info = {
+                        'symbol': symbol,
+                        'strike': strike_float,
+                        'mark_price': self.safe_float(opt.get('mark_price')),
+                        'bid': self.safe_float(quotes.get('best_bid')),
+                        'ask': self.safe_float(quotes.get('best_ask')),
+                        'bid_qty': self.safe_float(quotes.get('bid_size')),
+                        'ask_qty': self.safe_float(quotes.get('ask_size')),
+                        'oi': self.safe_float(opt.get('oi')),
+                        'volume': self.safe_float(opt.get('volume')),
+                        'bid_iv': self.safe_float(quotes.get('bid_iv')),
+                        'ask_iv': self.safe_float(quotes.get('ask_iv')),
+                    }
+                    
+                    if is_call:
+                        calls[strike_float] = option_info
+                    else:
+                        puts[strike_float] = option_info
+                        
+                except Exception as e:
                     continue
-                
-                option_data = {
-                    'symbol': opt.get('symbol', ''),
-                    'strike': strike_float,
-                    'type': 'CE' if 'C-' in opt.get('symbol', '') else 'PE',
-                    'mark_price': mark_price,
-                    'open_interest': oi,
-                    'volume': volume,
-                    'best_bid': best_bid,
-                    'best_ask': best_ask,
-                }
-                options.append(option_data)
             
             return {
                 'underlying': underlying,
@@ -180,15 +158,22 @@ class DeltaExchangeClient:
                 'atm_strike': atm_strike,
                 'expiry_date': expiry_date,
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'options': sorted(options, key=lambda x: (x['strike'], x['type']))
+                'calls': calls,
+                'puts': puts
             }
             
-        except requests.exceptions.Timeout:
-            logger.error(f"⏱️ Timeout fetching options for {underlying}")
-            return None
         except Exception as e:
             logger.error(f"❌ Option chain error for {underlying}: {e}")
             return None
+    
+    def safe_float(self, value, default=0):
+        """Safely convert to float"""
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (ValueError, TypeError):
+            return default
     
     def round_to_strike(self, price, underlying):
         """Round price to nearest strike"""
@@ -197,7 +182,7 @@ class DeltaExchangeClient:
         else:  # ETH
             return round(price / 100) * 100
     
-    def get_strike_range(self, atm_strike, underlying, count=5):
+    def get_strike_range(self, atm_strike, underlying, count=10):
         """Get ±count strikes around ATM"""
         if underlying == 'BTC':
             step = 1000
@@ -212,69 +197,112 @@ class DeltaExchangeClient:
 # ==================== TELEGRAM FORMATTER ====================
 class TelegramFormatter:
     @staticmethod
-    def format_option_chain_message(chain_data):
-        """Format option chain data for Telegram"""
+    def format_detailed_option_chain(chain_data):
+        """Format detailed option chain like Delta Exchange UI"""
         if not chain_data:
             return "❌ No data available"
         
         underlying = chain_data['underlying']
         spot = chain_data['spot_price']
         atm = chain_data['atm_strike']
-        expiry = chain_data.get('expiry_date', 'N/A')
+        expiry = chain_data['expiry_date']
         timestamp = chain_data['timestamp']
-        options = chain_data['options']
+        calls = chain_data['calls']
+        puts = chain_data['puts']
+        
+        # Calculate time to expiry
+        try:
+            expiry_dt = datetime.strptime(expiry, '%d-%m-%Y')
+            now = datetime.now()
+            delta = expiry_dt - now
+            days = delta.days
+            hours = delta.seconds // 3600
+            tte = f"{days}d:{hours}h"
+        except:
+            tte = "N/A"
         
         # Header
         message = f"""
 🔔 <b>{underlying} OPTION CHAIN</b>
 
-📊 Spot: <b>${spot:,.2f}</b>
+💰 Spot: <b>${spot:,.2f}</b>
 🎯 ATM: <b>${atm:,.0f}</b>
 📅 Expiry: {expiry}
+⏰ TTE: {tte}
 🕐 {timestamp}
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
-        if not options:
-            message += "\n⚠️ No options available\n"
+        # Get all strikes
+        all_strikes = sorted(set(list(calls.keys()) + list(puts.keys())))
+        
+        if not all_strikes:
+            message += "\n⚠️ No options data available\n"
             return message
         
-        # Separate CE and PE
-        ce_options = [opt for opt in options if opt['type'] == 'CE']
-        pe_options = [opt for opt in options if opt['type'] == 'PE']
+        # Table format
+        message += "\n<b>CALLS                    |   PUTS</b>\n"
+        message += "<code>Strike  | Bid   Ask  OI     | Bid   Ask  OI</code>\n"
+        message += "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
-        # Get unique strikes
-        strikes = sorted(list(set([opt['strike'] for opt in options])))
+        for strike in all_strikes:
+            call = calls.get(strike, {})
+            put = puts.get(strike, {})
+            
+            # ATM indicator
+            if strike == atm:
+                indicator = "🎯"
+            else:
+                indicator = "  "
+            
+            # Format strike
+            strike_str = f"${strike:,.0f}"
+            
+            # Call side
+            if call:
+                call_bid = f"${call.get('bid', 0):.1f}"
+                call_ask = f"${call.get('ask', 0):.1f}"
+                call_oi = self.format_large_number(call.get('oi', 0))
+                call_line = f"{call_bid:>6} {call_ask:>6} {call_oi:>5}"
+            else:
+                call_line = "   -      -     -  "
+            
+            # Put side
+            if put:
+                put_bid = f"${put.get('bid', 0):.1f}"
+                put_ask = f"${put.get('ask', 0):.1f}"
+                put_oi = self.format_large_number(put.get('oi', 0))
+                put_line = f"{put_bid:>6} {put_ask:>6} {put_oi:>5}"
+            else:
+                put_line = "   -      -     -  "
+            
+            message += f"<code>{indicator}{strike_str:>8} | {call_line} | {put_line}</code>\n"
         
-        # Calls
-        message += "\n📈 <b>CALLS (CE)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        message += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         
-        for strike in strikes:
-            ce = next((opt for opt in ce_options if opt['strike'] == strike), None)
-            if ce:
-                mark = "🎯 " if strike == atm else ""
-                message += f"\n{mark}<b>Strike ${ce['strike']:,.0f}</b>\n"
-                message += f"Premium: ${ce['mark_price']:.2f} | "
-                message += f"OI: {ce['open_interest']:,.0f}\n"
+        # Summary stats
+        total_call_oi = sum(c.get('oi', 0) for c in calls.values())
+        total_put_oi = sum(p.get('oi', 0) for p in puts.values())
         
-        # Puts
-        message += "\n\n📉 <b>PUTS (PE)</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"\n📊 <b>Summary</b>\n"
+        message += f"Call OI: {self.format_large_number(total_call_oi)}\n"
+        message += f"Put OI: {self.format_large_number(total_put_oi)}\n"
+        message += f"PCR: {(total_put_oi/total_call_oi if total_call_oi > 0 else 0):.2f}\n"
         
-        for strike in strikes:
-            pe = next((opt for opt in pe_options if opt['strike'] == strike), None)
-            if pe:
-                mark = "🎯 " if strike == atm else ""
-                message += f"\n{mark}<b>Strike ${pe['strike']:,.0f}</b>\n"
-                message += f"Premium: ${pe['mark_price']:.2f} | "
-                message += f"OI: {pe['open_interest']:,.0f}\n"
-        
-        message += "\n━━━━━━━━━━━━━━━━━━━━\n⚡ Delta Exchange India"
+        message += "\n⚡ <i>Delta Exchange India</i>"
         
         return message
+    
+    @staticmethod
+    def format_large_number(num):
+        """Format large numbers (K for thousands)"""
+        if num >= 1000:
+            return f"{num/1000:.1f}K"
+        return f"{num:.0f}"
 
 # ==================== MAIN BOT ====================
-class DeltaTestBot:
+class DeltaOptionBot:
     def __init__(self):
         self.client = DeltaExchangeClient()
         self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -304,18 +332,18 @@ class DeltaTestBot:
             logger.error(f"❌ Telegram error: {e}")
     
     async def fetch_and_send_data(self, underlying):
-        """Fetch option chain and send to Telegram"""
+        """Fetch detailed option chain and send to Telegram"""
         try:
             logger.info(f"🔍 Fetching {underlying}...")
             
-            chain_data = self.client.get_option_chain_simple(underlying)
+            chain_data = self.client.get_option_chain_detailed(underlying)
             
             if chain_data:
-                message = self.formatter.format_option_chain_message(chain_data)
+                message = self.formatter.format_detailed_option_chain(chain_data)
                 await self.send_telegram_message(message)
             else:
                 logger.warning(f"⚠️ No data for {underlying}")
-                await self.send_telegram_message(f"⚠️ No data available for {underlying}")
+                await self.send_telegram_message(f"⚠️ No option data for {underlying}")
                 
         except Exception as e:
             logger.error(f"❌ Error for {underlying}: {e}")
@@ -323,28 +351,35 @@ class DeltaTestBot:
     async def run(self):
         """Main loop"""
         logger.info("="*50)
-        logger.info("🚀 DELTA BOT STARTED")
+        logger.info("🚀 DELTA OPTION CHAIN BOT STARTED")
         logger.info("="*50)
         
         startup_msg = """
-🚀 <b>DELTA BOT STARTED</b>
+🚀 <b>DELTA OPTION CHAIN BOT</b>
 
-📊 Monitoring: BTC & ETH
+📊 Assets: BTC & ETH
 ⏱️ Interval: 1 minute
-📡 Data: Option Chain (ATM ±5)
+📈 Data: Full Option Chain
+   • Bid/Ask Prices
+   • Open Interest
+   • Strike-wise Analysis
+   • PCR Ratio
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 ⚡ Status: 🟢 <b>ACTIVE</b>
 """
         await self.send_telegram_message(startup_msg)
         
         while True:
             try:
+                # BTC Option Chain
                 await self.fetch_and_send_data('BTC')
                 await asyncio.sleep(5)
                 
+                # ETH Option Chain
                 await self.fetch_and_send_data('ETH')
                 
+                # Wait 1 minute
                 logger.info("⏳ Waiting 1 minute...\n")
                 await asyncio.sleep(55)
                 
@@ -362,7 +397,7 @@ if __name__ == "__main__":
         exit(1)
     
     try:
-        bot = DeltaTestBot()
+        bot = DeltaOptionBot()
         asyncio.run(bot.run())
     except Exception as e:
         logger.error(f"💥 Fatal: {e}")
