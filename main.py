@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-DELTA EXCHANGE OPTION CHAIN BOT (OPTIMIZED)
-===========================================
-Efficient Bulk Data Fetching
+DELTA EXCHANGE OPTION CHAIN BOT (RAILWAY FIX)
+=============================================
+1. Fetches Product Metadata (For Expiry Dates)
+2. Fetches Live Tickers (For Price/Vol)
+3. Merges them accurately
 """
 
 import os
@@ -19,11 +21,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment Variables
+# ENV Variables
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-
-# Delta Exchange API Base URL
 BASE_URL = "https://api.india.delta.exchange"
 
 # ==================== DELTA API CLIENT ====================
@@ -34,255 +34,258 @@ class DeltaExchangeClient:
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         })
+        # Cache for product metadata to save API calls
+        self.product_map = {}
+        self.last_product_fetch = None
 
-    def get_bulk_tickers(self):
-        """Fetch ALL tickers in ONE request to avoid rate limits"""
+    def get_products(self):
+        """Fetch static product data (Expiries)"""
+        # Refresh cache every 1 hour
+        if self.product_map and self.last_product_fetch:
+            if (datetime.now() - self.last_product_fetch).total_seconds() < 3600:
+                return self.product_map
+
         try:
-            url = f"{BASE_URL}/v2/tickers"
-            # No parameters means fetch everything (Spot, Futures, Options)
-            response = self.session.get(url, timeout=10)
+            url = f"{BASE_URL}/v2/products"
+            params = {'contract_types': 'call_options,put_options', 'states': 'live'}
+            response = self.session.get(url, params=params, timeout=10)
             
             if response.status_code == 200:
-                data = response.json()
-                if data.get('success'):
-                    return data.get('result', [])
+                data = response.json().get('result', [])
+                # Map Symbol -> Expiry Date Object
+                new_map = {}
+                for p in data:
+                    settlement = p.get('settlement_time')
+                    if settlement:
+                        try:
+                            dt = datetime.strptime(settlement, '%Y-%m-%dT%H:%M:%SZ')
+                            new_map[p['symbol']] = dt
+                        except:
+                            continue
+                
+                self.product_map = new_map
+                self.last_product_fetch = datetime.now()
+                logger.info(f"📚 Loaded {len(new_map)} products (Metadata)")
+                return self.product_map
+            return {}
+        except Exception as e:
+            logger.error(f"❌ Product Fetch Error: {e}")
+            return {}
+
+    def get_tickers(self):
+        """Fetch live prices"""
+        try:
+            url = f"{BASE_URL}/v2/tickers"
+            response = self.session.get(url, timeout=10)
+            if response.status_code == 200:
+                return response.json().get('result', [])
             return []
         except Exception as e:
-            logger.error(f"❌ Bulk Ticker Fetch Error: {e}")
+            logger.error(f"❌ Ticker Fetch Error: {e}")
             return []
 
-    def parse_expiry(self, symbol_info):
-        """Extract expiry date object from symbol info safely"""
-        try:
-            # Symbol format usually: C-BTC-211125-90000
-            # But relying on settlement_time is safer if available
-            settlement = symbol_info.get('settlement_time')
-            if settlement:
-                return datetime.strptime(settlement, '%Y-%m-%dT%H:%M:%SZ')
-        except:
-            pass
-        return None
-
     def get_option_chain_data(self, underlying='BTC'):
-        """Get chain data by processing bulk tickers locally"""
         try:
-            # 1. Get ALL data in one go
-            all_tickers = self.get_bulk_tickers()
-            if not all_tickers:
+            # 1. Ensure we have metadata (Expiry dates)
+            product_map = self.get_products()
+            if not product_map:
+                logger.error("❌ Could not fetch Product Metadata")
                 return None
 
-            logger.info(f"📦 Processed {len(all_tickers)} total market tickers")
+            # 2. Fetch Live Tickers
+            all_tickers = self.get_tickers()
+            if not all_tickers: 
+                logger.error("❌ Could not fetch Tickers")
+                return None
 
-            # 2. Find Spot Price (Mark Price of Perpetual)
-            perp_symbol = f"{underlying}USD" # e.g. BTCUSD
+            # 3. Find Spot Price
+            perp_symbol = f"{underlying}USD"
             spot_ticker = next((t for t in all_tickers if t['symbol'] == perp_symbol), None)
-            
-            if not spot_ticker:
-                logger.error(f"❌ Spot price not found for {underlying}")
+            if not spot_ticker: 
+                logger.warning(f"⚠️ Spot symbol {perp_symbol} not found")
                 return None
-
-            spot_price = float(spot_ticker.get('mark_price') or spot_ticker.get('close', 0))
+            
+            spot_price = float(spot_ticker.get('mark_price') or 0)
             logger.info(f"💰 {underlying} Spot: {spot_price}")
 
-            # 3. Filter only Options for this Underlying
-            # Option symbols usually look like "C-BTC-..." or contain contract_type check
-            options_tickers = [
-                t for t in all_tickers 
-                if t.get('contract_type') in ['call_options', 'put_options'] 
-                and t.get('underlying_asset_symbol') == underlying
-            ]
-
-            if not options_tickers:
-                return None
-
-            # 4. Find Nearest Expiry
+            # 4. Merge Ticker Data with Expiry Data
+            options_data = []
             now = datetime.now()
-            expiry_map = {} # Date string -> Date Object
 
-            for opt in options_tickers:
-                exp_dt = self.parse_expiry(opt)
-                # Adjust for IST (roughly check if future)
-                if exp_dt and exp_dt > now:
-                    date_str = exp_dt.strftime('%d-%m-%Y')
-                    expiry_map[date_str] = exp_dt
+            for t in all_tickers:
+                sym = t.get('symbol')
+                # Check if this symbol exists in our Options Product Map
+                if sym in product_map:
+                    expiry_dt = product_map[sym]
+                    # Only take future expiries
+                    if expiry_dt > now:
+                        t['expiry_dt'] = expiry_dt # Inject expiry into ticker
+                        options_data.append(t)
 
-            if not expiry_map:
+            logger.info(f"✅ Found {len(options_data)} valid future options for {underlying}")
+
+            if not options_data:
                 return None
 
-            # Sort expiries and pick nearest
-            sorted_expiries = sorted(expiry_map.items(), key=lambda x: x[1])
-            nearest_expiry_str = sorted_expiries[0][0]
+            # 5. Find Nearest Expiry
+            # Get unique dates
+            unique_dates = sorted(list(set(o['expiry_dt'] for o in options_data)))
+            if not unique_dates: return None
+            
+            nearest_expiry_dt = unique_dates[0]
+            nearest_expiry_str = nearest_expiry_dt.strftime('%d-%m-%Y')
             
             logger.info(f"📅 Selected Expiry: {nearest_expiry_str}")
 
-            # 5. Filter options for this specific expiry
-            active_options = []
-            for opt in options_tickers:
-                exp_dt = self.parse_expiry(opt)
-                if exp_dt and exp_dt.strftime('%d-%m-%Y') == nearest_expiry_str:
-                    active_options.append(opt)
-
-            # 6. Organize into Strikes
-            calls = {}
-            puts = {}
+            # 6. Organize Strikes
+            calls, puts = {}, {}
             
-            for opt in active_options:
+            for opt in options_data:
+                if opt['expiry_dt'] != nearest_expiry_dt:
+                    continue
+                
                 try:
+                    # Note: v2/tickers usually has strike_price? If not, need to parse or get from product
+                    # But usually tickers have it. If fails, we might need product specs.
                     strike = float(opt.get('strike_price', 0))
-                    quotes = opt.get('quotes', {})
-                    
+                    if strike == 0: continue # Skip invalid strikes
+
+                    # Contract Type Detection
+                    c_type = opt.get('contract_type', '').lower()
+                    # Fallback if contract_type is missing in ticker, guess by symbol usually ends in C or P
+                    is_call = 'call' in c_type or opt['symbol'].endswith('_C') or '-C' in opt['symbol']
+                    is_put = 'put' in c_type or opt['symbol'].endswith('_P') or '-P' in opt['symbol']
+
                     data = {
                         'symbol': opt['symbol'],
-                        'strike': strike,
-                        'bid': float(quotes.get('best_bid', 0) or 0),
-                        'ask': float(quotes.get('best_ask', 0) or 0),
+                        'ltp': float(opt.get('mark_price', 0) or 0),
                         'oi': float(opt.get('oi', 0) or 0),
                         'volume': float(opt.get('volume', 0) or 0)
                     }
+                    
+                    if is_call: calls[strike] = data
+                    elif is_put: puts[strike] = data
 
-                    if opt.get('contract_type') == 'call_options':
-                        calls[strike] = data
-                    else:
-                        puts[strike] = data
-                except:
+                except Exception as e:
                     continue
 
-            # 7. Calculate ATM and Range
-            atm_strike = self.round_to_strike(spot_price, underlying)
+            # 7. Filter Range around ATM
+            atm = self.round_to_strike(spot_price, underlying)
+            strikes = self.get_strike_range(atm, underlying, count=5)
             
-            # Filter relevant strikes (e.g., 5 up, 5 down)
-            relevant_strikes = self.get_strike_range(atm_strike, underlying, count=6)
-            
-            final_calls = {k: v for k, v in calls.items() if k in relevant_strikes}
-            final_puts = {k: v for k, v in puts.items() if k in relevant_strikes}
-
             return {
-                'underlying': underlying,
-                'spot_price': spot_price,
-                'atm_strike': atm_strike,
-                'expiry_date': nearest_expiry_str,
-                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'calls': final_calls,
-                'puts': final_puts
+                'u': underlying, 'spot': spot_price, 'atm': atm, 'exp': nearest_expiry_str,
+                'calls': {k: calls[k] for k in strikes if k in calls},
+                'puts': {k: puts[k] for k in strikes if k in puts}
             }
 
         except Exception as e:
-            logger.error(f"❌ Chain Logic Error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"❌ Logic Error: {e}")
             return None
 
     def round_to_strike(self, price, underlying):
         step = 1000 if underlying == 'BTC' else 100
         return round(price / step) * step
 
-    def get_strike_range(self, atm, underlying, count=6):
+    def get_strike_range(self, atm, underlying, count=5):
         step = 1000 if underlying == 'BTC' else 100
-        strikes = []
-        for i in range(-count, count + 1):
-            strikes.append(atm + (i * step))
-        return strikes
+        return [atm + (i * step) for i in range(-count, count + 1)]
 
-# ==================== TELEGRAM FORMATTER ====================
+# ==================== FORMATTER ====================
 class TelegramFormatter:
     @staticmethod
-    def format_large(num):
-        if num >= 1000: return f"{num/1000:.1f}K"
+    def num_fmt(num):
+        if num >= 1000000: return f"{num/1000000:.1f}M"
+        if num >= 1000: return f"{num/1000:.0f}K"
         return f"{num:.0f}"
 
     def generate_message(self, data):
-        if not data: return "❌ Data fetch failed."
-
-        u, spot, atm = data['underlying'], data['spot_price'], data['atm_strike']
-        exp, time = data['expiry_date'], data['timestamp']
+        if not data: return None
+        
+        u, spot, atm, exp = data['u'], data['spot'], data['atm'], data['exp']
         calls, puts = data['calls'], data['puts']
 
-        # Header
-        msg = f"🔔 <b>{u} OPTION CHAIN</b>\n\n"
-        msg += f"💰 Spot: <b>${spot:,.2f}</b>\n"
-        msg += f"🎯 ATM: <b>${atm:,.0f}</b>\n"
+        msg = f"🔔 <b>{u} CHAIN (Vol & OI)</b>\n"
+        msg += f"🎯 Spot: <b>{spot:,.0f}</b> | ATM: <b>{atm:,.0f}</b>\n"
         msg += f"📅 Exp: <b>{exp}</b>\n"
-        msg += f"🕒 {time}\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
-        msg += "<b>  CALLS       |    PUTS</b>\n"
-        msg += "<code>Bid  Ask  OI | Bid  Ask  OI</code>\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "<b>  CALLS (Vol/OI)   |   PUTS (Vol/OI)</b>\n"
+        msg += "<code> Vol   OI  LTP | LTP  OI   Vol </code>\n"
+        msg += "━━━━━━━━━━━━━━━━━━━━━\n"
 
-        # Table Rows
         strikes = sorted(set(list(calls.keys()) + list(puts.keys())))
         
         for k in strikes:
             c = calls.get(k, {})
             p = puts.get(k, {})
             
-            # Formatting
-            c_b = f"{c.get('bid',0):.0f}" if c.get('bid') else "-"
-            c_a = f"{c.get('ask',0):.0f}" if c.get('ask') else "-"
-            c_oi = self.format_large(c.get('oi', 0))
+            c_v = self.num_fmt(c.get('volume', 0))
+            c_o = self.num_fmt(c.get('oi', 0))
+            c_l = f"{c.get('ltp',0):.0f}" if c.get('ltp') else "-"
             
-            p_b = f"{p.get('bid',0):.0f}" if p.get('bid') else "-"
-            p_a = f"{p.get('ask',0):.0f}" if p.get('ask') else "-"
-            p_oi = self.format_large(p.get('oi', 0))
+            p_l = f"{p.get('ltp',0):.0f}" if p.get('ltp') else "-"
+            p_o = self.num_fmt(p.get('oi', 0))
+            p_v = self.num_fmt(p.get('volume', 0))
 
-            # Strike Label
-            st_lbl = f"{k/1000:.0f}K" if u == 'BTC' else f"{k:.0f}"
-            marker = "🎯" if k == atm else "  "
+            marker = "🔹" if k == atm else "  "
+            strike_lbl = f"{k/1000:.1f}k" if u == 'BTC' else f"{k:.0f}"
 
-            row = f"{c_b:>3} {c_a:>3} {c_oi:>3}|{p_b:>3} {p_a:>3} {p_oi:>3} {marker}{st_lbl}"
-            msg += f"<code>{row}</code>\n"
+            row = f"{c_v:>3} {c_o:>3} {c_l:>4}|{p_l:<4} {p_o:<3} {p_v:<3}"
+            msg += f"<code>{row}</code> {marker}<b>{strike_lbl}</b>\n"
 
-        # Summary
-        c_tot = sum(c.get('oi',0) for c in calls.values())
-        p_tot = sum(p.get('oi',0) for p in puts.values())
-        pcr = p_tot / c_tot if c_tot > 0 else 0
-
-        msg += "\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"📊 <b>PCR: {pcr:.2f}</b> | Call: {self.format_large(c_tot)} | Put: {self.format_large(p_tot)}"
-        
+        msg += "━━━━━━━━━━━━━━━━━━━━━\n"
+        msg += "<i>Values in K (Thousands) or M (Millions)</i>"
         return msg
 
-# ==================== BOT RUNNER ====================
-class BotRunner:
-    def __init__(self):
-        self.client = DeltaExchangeClient()
-        self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        self.fmt = TelegramFormatter()
+# ==================== RUNNER ====================
+async def main():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN not set")
+        return
 
-    async def send_update(self, underlying):
-        data = self.client.get_option_chain_data(underlying)
-        if data:
-            msg = self.fmt.generate_message(data)
-            try:
-                await self.bot.send_message(
+    client = DeltaExchangeClient()
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    fmt = TelegramFormatter()
+
+    logger.info("🚀 Bot Started (Railway Optimized)...")
+    
+    # Initial fetch
+    client.get_products()
+    
+    while True:
+        try:
+            # BTC
+            data = client.get_option_chain_data('BTC')
+            if data:
+                await bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID, 
-                    text=msg, 
+                    text=fmt.generate_message(data), 
                     parse_mode='HTML'
                 )
-                logger.info(f"✅ Sent {underlying} update")
-            except Exception as e:
-                logger.error(f"⚠️ Telegram Error: {e}")
-        else:
-            logger.warning(f"⚠️ No data generated for {underlying}")
+                logger.info("✅ BTC Update Sent")
+            else:
+                logger.warning("⚠️ Still no data for BTC (Check Logs above)")
 
-    async def run(self):
-        logger.info("🚀 Bot Started...")
-        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🤖 <b>Delta Bot Active</b>\nFetching Complete Chain...", parse_mode='HTML')
-        
-        while True:
-            await self.send_update('BTC')
-            await asyncio.sleep(5) # Short gap
-            await self.send_update('ETH')
+            await asyncio.sleep(5)
+
+            # ETH
+            data = client.get_option_chain_data('ETH')
+            if data:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID, 
+                    text=fmt.generate_message(data), 
+                    parse_mode='HTML'
+                )
+                logger.info("✅ ETH Update Sent")
             
-            logger.info("💤 Sleeping 60s...")
-            await asyncio.sleep(60)
+        except Exception as e:
+            logger.error(f"⚠️ Main Loop Error: {e}")
+        
+        logger.info("💤 Sleeping 60s...")
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ ENV Variables Missing!")
-        exit()
-        
     try:
-        runner = BotRunner()
-        asyncio.run(runner.run())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("🛑 Stopped")
+        pass
