@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DELTA EXCHANGE DASHBOARD (ROOT CAUSE FIXED)
-===========================================
-1. Fixed 'BTC' string bug (Puts were identified as Calls)
-2. Fixed IV fetching logic
-3. Accurate Data Alignment
+DELTA EXCHANGE DASHBOARD (OI & IV FIX)
+======================================
+1. Product-First Approach: Ensures only valid Options are fetched.
+2. Aggregation: Sums OI/Vol if multiple tickers exist for same strike.
+3. IV Fix: Improved parsing logic for Greeks.
 """
 
 import os
@@ -18,6 +18,7 @@ from io import BytesIO
 from datetime import datetime
 from telegram import Bot
 import logging
+import numpy as np
 
 # ==================== CONFIGURATION ====================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -36,16 +37,29 @@ class DeltaDashboard:
 
     # ---------------- DATA FETCHING ----------------
     def get_products(self):
+        """
+        Fetch all active Call/Put products.
+        Returns a dict: symbol -> {expiry, type, strike}
+        """
         try:
             res = self.session.get(f"{BASE_URL}/v2/products", params={'contract_types': 'call_options,put_options', 'states': 'live'}, timeout=10)
             if res.status_code == 200:
                 data = res.json().get('result', [])
                 mapping = {}
                 for p in data:
-                    if p.get('settlement_time'):
+                    sym = p.get('symbol')
+                    settlement = p.get('settlement_time')
+                    c_type = p.get('contract_type') # call_options / put_options
+                    strike = float(p.get('strike_price', 0))
+                    
+                    if settlement and sym:
                         try:
-                            dt = datetime.strptime(p['settlement_time'], '%Y-%m-%dT%H:%M:%SZ')
-                            mapping[p['symbol']] = dt
+                            dt = datetime.strptime(settlement, '%Y-%m-%dT%H:%M:%SZ')
+                            mapping[sym] = {
+                                'expiry': dt,
+                                'type': 'C' if c_type == 'call_options' else 'P',
+                                'strike': strike
+                            }
                         except: pass
                 return mapping
             return {}
@@ -77,111 +91,103 @@ class DeltaDashboard:
 
     def get_chain_data(self, underlying='BTC'):
         try:
-            # 1. Fetch Data
+            # 1. Get Products (Metadata)
+            product_map = self.get_products()
+            if not product_map: return None
+
+            # 2. Get Tickers (Live Data)
             tickers_res = self.session.get(f"{BASE_URL}/v2/tickers", timeout=10)
             all_tickers = tickers_res.json().get('result', [])
-            product_map = self.get_products()
             
-            if not all_tickers or not product_map: return None
+            if not all_tickers: return None
 
-            # 2. Spot Price
+            # 3. Spot Price
             spot_sym = f"{underlying}USD"
             spot_data = next((t for t in all_tickers if t['symbol'] == spot_sym), None)
             spot_price = float(spot_data['mark_price']) if spot_data else 0
 
-            # 3. Nearest Expiry
+            # 4. Determine Nearest Expiry
             valid_dates = []
             now = datetime.now()
-            for sym, dt in product_map.items():
-                if underlying in sym and dt > now:
-                    valid_dates.append(dt)
+            for sym, info in product_map.items():
+                if underlying in sym and info['expiry'] > now:
+                    valid_dates.append(info['expiry'])
             
             if not valid_dates: return None
             nearest_exp = sorted(list(set(valid_dates)))[0]
 
-            # 4. Separate Calls and Puts Lists (FIXED LOGIC)
-            calls_list = []
-            puts_list = []
-
+            # 5. Match Tickers to Products
+            data_rows = []
+            
             for t in all_tickers:
                 sym = t['symbol']
+                
+                # Verify this ticker is in our Valid Option List
                 if sym not in product_map: continue
-                if product_map[sym] != nearest_exp: continue
+                
+                p_info = product_map[sym]
+                
+                # Filter by Expiry & Underlying
+                if p_info['expiry'] != nearest_exp: continue
                 if underlying not in sym: continue
 
-                strike = float(t.get('strike_price', 0))
-                if strike == 0: continue
-
-                # Extract Data
-                vol_qty = float(t.get('volume', 0) or 0)
-                mark_price = float(t.get('mark_price', 0) or 0)
-                vol_usd = float(t.get('turnover', 0) or (vol_qty * mark_price))
+                # Extract Values
+                strike = p_info['strike']
+                o_type = p_info['type'] # C or P
                 
-                # IV Fetching
-                greeks = t.get('greeks')
+                # Live Data
+                ltp = float(t.get('mark_price', 0) or 0)
+                oi = float(t.get('oi', 0) or 0) # This is Contract Open Interest
+                
+                # Volume Calculation
+                vol_qty = float(t.get('volume', 0) or 0)
+                turnover = float(t.get('turnover', 0) or 0)
+                vol_usd = turnover if turnover > 0 else (vol_qty * ltp)
+
+                # IV Extraction (Robust)
                 iv = 0
+                greeks = t.get('greeks')
                 if greeks and isinstance(greeks, dict):
                     iv = float(greeks.get('implied_volatility', 0) or 0)
-
-                data = {
+                
+                data_rows.append({
                     'strike': strike,
-                    'ltp': mark_price,
-                    'oi': float(t.get('oi', 0) or 0),
+                    'type': o_type,
+                    'ltp': ltp,
+                    'oi': oi,
                     'iv': iv,
                     'vol': vol_usd
-                }
+                })
 
-                # --- THE FIX: Use contract_type instead of string matching ---
-                c_type = t.get('contract_type', '').lower()
-                
-                if c_type == 'call_options':
-                    calls_list.append(data)
-                elif c_type == 'put_options':
-                    puts_list.append(data)
-                else:
-                    # Fallback if contract_type is missing
-                    if '_C' in sym or sym.endswith('C'):
-                        calls_list.append(data)
-                    elif '_P' in sym or sym.endswith('P'):
-                        puts_list.append(data)
+            # 6. Create DataFrame & Aggregate
+            df = pd.DataFrame(data_rows)
+            if df.empty: return None, 0, ""
 
-            # 5. Create DataFrames & Merge
-            df_c = pd.DataFrame(calls_list)
-            df_p = pd.DataFrame(puts_list)
+            # --- AGGREGATION FIX ---
+            # Group by Strike and Type to handle duplicate tickers for same strike
+            # We sum OI and Vol, take Mean of LTP, Max of IV
+            df_agg = df.groupby(['strike', 'type']).agg({
+                'ltp': 'mean',
+                'oi': 'sum',     # <--- SUM OI fixes the "1 vs 100" issue
+                'vol': 'sum',    # <--- SUM Volume
+                'iv': 'max'      # Take max found IV
+            }).reset_index()
 
-            if df_c.empty and df_p.empty: return None, 0, ""
+            # 7. Pivot Table (Calls vs Puts)
+            calls = df_agg[df_agg['type'] == 'C'].set_index('strike')
+            puts = df_agg[df_agg['type'] == 'P'].set_index('strike')
 
-            # Remove duplicates (keep highest OI)
-            if not df_c.empty:
-                df_c = df_c.sort_values('oi', ascending=False).drop_duplicates('strike')
-            if not df_p.empty:
-                df_p = df_p.sort_values('oi', ascending=False).drop_duplicates('strike')
-
-            # MERGE (Outer Join to keep both sides even if one is missing)
-            if not df_c.empty and not df_p.empty:
-                chain = pd.merge(df_c, df_p, on='strike', how='outer', suffixes=('_c', '_p'))
-            elif not df_c.empty:
-                chain = df_c.rename(columns=lambda x: x + '_c' if x != 'strike' else x)
-                for col in ['ltp_p', 'oi_p', 'iv_p', 'vol_p']: chain[col] = 0
-            else:
-                chain = df_p.rename(columns=lambda x: x + '_p' if x != 'strike' else x)
-                for col in ['ltp_c', 'oi_c', 'iv_c', 'vol_c']: chain[col] = 0
-
+            # Merge
+            chain = pd.concat([calls, puts], axis=1, keys=['Call', 'Put'])
+            chain = chain.sort_index()
             chain = chain.fillna(0)
-            chain = chain.sort_values('strike')
 
-            # 6. Filter Range (ATM +/- 8)
-            idx = (chain['strike'] - spot_price).abs().idxmin()
+            # 8. Filter Range
+            idx = (chain.index.to_series() - spot_price).abs().idxmin()
             try:
                 loc = chain.index.get_loc(idx)
-                # Handle potential duplicate index issue
-                if isinstance(loc, slice): loc = loc.start
-                if hasattr(loc, '__iter__'): loc = loc[0]
-                
-                loc = int(loc)
                 start = max(0, loc - 8)
                 end = min(len(chain), loc + 9)
-                
                 final_df = chain.iloc[start:end].copy()
                 return final_df, spot_price, nearest_exp.strftime('%d-%b')
             except:
@@ -216,7 +222,10 @@ class DeltaDashboard:
         table_data = []
         col_labels = ['Vol($)', 'OI', 'IV%', 'LTP', 'STRIKE', 'LTP', 'IV%', 'OI', 'Vol($)']
 
-        for _, row in chain_df.iterrows():
+        for strike, row in chain_df.iterrows():
+            c = row['Call']
+            p = row['Put']
+
             def fmt(val, is_curr=False):
                 if val == 0: return "-"
                 if is_curr: return f"{val:,.0f}"
@@ -224,17 +233,17 @@ class DeltaDashboard:
                 if val > 1000: return f"{val/1000:.0f}K"
                 return f"{int(val)}"
 
-            # IV Handling
-            iv_c = row['iv_c']
-            if 0 < iv_c < 5: iv_c *= 100 # Convert 0.5 to 50%
+            # IV Handling: Display properly
+            c_iv = c.get('iv', 0)
+            if 0 < c_iv < 5: c_iv *= 100
             
-            iv_p = row['iv_p']
-            if 0 < iv_p < 5: iv_p *= 100
+            p_iv = p.get('iv', 0)
+            if 0 < p_iv < 5: p_iv *= 100
 
             r = [
-                fmt(row['vol_c']), fmt(row['oi_c']), fmt(iv_c), fmt(row['ltp_c'], True),
-                f"{int(row['strike'])}",
-                fmt(row['ltp_p'], True), fmt(iv_p), fmt(row['oi_p']), fmt(row['vol_p'])
+                fmt(c.get('vol', 0)), fmt(c.get('oi', 0)), fmt(c_iv), fmt(c.get('ltp', 0), True),
+                f"{int(strike)}",
+                fmt(p.get('ltp', 0), True), fmt(p_iv), fmt(p.get('oi', 0)), fmt(p.get('vol', 0))
             ]
             table_data.append(r)
 
