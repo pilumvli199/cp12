@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DELTA EXCHANGE DASHBOARD (FIXED)
-================================
-- Correct API endpoint for option chain with expiry_date filter
-- Proper OI & IV data extraction
-- Matches website data exactly
+DELTA EXCHANGE DASHBOARD (FIXED V2)
+===================================
+- Uses oi_value_usd instead of oi (contract count)
+- Proper IV extraction from mark_vol and quotes
+- Handles all edge cases
 """
 
 import os
@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 import asyncio
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import Bot
 import logging
 
@@ -34,10 +34,10 @@ class DeltaDashboard:
         self.session = requests.Session()
         self.session.headers.update({
             'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            'Accept': 'application/json',
+            'User-Agent': 'python-delta-dashboard'
         })
 
-    # ---------------- HELPER: Get Available Expiries ----------------
     def get_available_expiries(self, underlying='BTC'):
         """Get all available expiry dates for an underlying"""
         try:
@@ -46,12 +46,13 @@ class DeltaDashboard:
                 'contract_types': 'call_options,put_options',
                 'states': 'live'
             }
-            res = self.session.get(url, params=params, timeout=10)
+            res = self.session.get(url, params=params, timeout=15)
             if res.status_code != 200:
+                logger.error(f"Products API error: {res.status_code}")
                 return []
             
             products = res.json().get('result', [])
-            expiries = set()
+            expiry_map = {}  # expiry_date -> total OI
             now = datetime.utcnow()
             
             for p in products:
@@ -64,16 +65,20 @@ class DeltaDashboard:
                     try:
                         dt = datetime.strptime(settlement, '%Y-%m-%dT%H:%M:%SZ')
                         if dt > now:
-                            expiries.add(dt)
+                            date_key = dt.strftime('%d-%m-%Y')
+                            if date_key not in expiry_map:
+                                expiry_map[date_key] = dt
                     except:
                         pass
             
-            return sorted(list(expiries))
+            # Sort by date
+            sorted_expiries = sorted(expiry_map.items(), key=lambda x: x[1])
+            return sorted_expiries
+            
         except Exception as e:
             logger.error(f"Error getting expiries: {e}")
             return []
 
-    # ---------------- DATA FETCHING ----------------
     def get_candles(self, symbol='BTCUSD', resolution='15m', count=200):
         try:
             end_time = int(time.time())
@@ -86,7 +91,7 @@ class DeltaDashboard:
                 'start': start_time,
                 'end': end_time
             }
-            res = self.session.get(url, params=params, timeout=10)
+            res = self.session.get(url, params=params, timeout=15)
             
             if res.status_code == 200:
                 candles = res.json().get('result', [])
@@ -106,37 +111,48 @@ class DeltaDashboard:
             logger.error(f"Candles Error: {e}")
             return None
 
+    def safe_float(self, val, default=0.0):
+        """Safely convert to float"""
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except:
+            return default
+
     def get_chain_data(self, underlying='BTC'):
         """
-        Fetch option chain using the CORRECT API endpoint:
-        /v2/tickers?contract_types=call_options,put_options&underlying_asset_symbols=BTC&expiry_date=DD-MM-YYYY
+        Fetch option chain with CORRECT data mapping:
+        - OI: Use oi_value_usd (USD value, not contract count)
+        - IV: Use mark_vol or quotes.ask_iv/bid_iv
+        - LTP: Use mark_price
         """
         try:
-            # 1. Get spot price first
+            # 1. Get spot price
             spot_url = f"{BASE_URL}/v2/tickers/{underlying}USD"
             spot_res = self.session.get(spot_url, timeout=10)
             spot_price = 0
             if spot_res.status_code == 200:
                 spot_data = spot_res.json().get('result', {})
-                spot_price = float(spot_data.get('mark_price', 0) or spot_data.get('close', 0) or 0)
+                spot_price = self.safe_float(spot_data.get('mark_price') or spot_data.get('close'))
             
             if spot_price == 0:
                 logger.error("Could not get spot price")
                 return None, 0, ""
 
-            # 2. Get available expiries and select nearest
+            logger.info(f"💰 {underlying} Spot: ${spot_price:,.2f}")
+
+            # 2. Get available expiries
             expiries = self.get_available_expiries(underlying)
             if not expiries:
                 logger.error("No expiries found")
                 return None, 0, ""
             
-            # Select nearest expiry (first one)
-            target_expiry = expiries[0]
-            expiry_str = target_expiry.strftime('%d-%m-%Y')  # Format: DD-MM-YYYY
-            
-            logger.info(f"📅 Using expiry: {expiry_str} for {underlying}")
+            # Use nearest expiry
+            expiry_str, expiry_dt = expiries[0]
+            logger.info(f"📅 Using expiry: {expiry_str}")
 
-            # 3. Fetch option chain with CORRECT API
+            # 3. Fetch option chain with expiry filter
             url = f"{BASE_URL}/v2/tickers"
             params = {
                 'contract_types': 'call_options,put_options',
@@ -144,152 +160,127 @@ class DeltaDashboard:
                 'expiry_date': expiry_str
             }
             
-            res = self.session.get(url, params=params, timeout=15)
+            logger.info(f"🔍 Fetching: {url}?{params}")
+            res = self.session.get(url, params=params, timeout=20)
+            
             if res.status_code != 200:
-                logger.error(f"API Error: {res.status_code} - {res.text}")
+                logger.error(f"Tickers API error: {res.status_code} - {res.text[:200]}")
                 return None, 0, ""
             
             tickers = res.json().get('result', [])
+            logger.info(f"📊 Received {len(tickers)} tickers")
+            
             if not tickers:
                 logger.error("No tickers returned")
                 return None, 0, ""
-            
-            logger.info(f"📊 Got {len(tickers)} option contracts")
 
-            # 4. Parse the data
-            data_rows = []
+            # 4. Parse each ticker
+            calls_data = {}
+            puts_data = {}
+            
             for t in tickers:
                 sym = t.get('symbol', '')
                 contract_type = t.get('contract_type', '')
                 
-                # Determine Call or Put
-                if contract_type == 'call_options' or sym.startswith('C-'):
-                    o_type = 'C'
-                elif contract_type == 'put_options' or sym.startswith('P-'):
-                    o_type = 'P'
-                else:
+                # Determine if Call or Put
+                is_call = contract_type == 'call_options' or sym.startswith('C-')
+                is_put = contract_type == 'put_options' or sym.startswith('P-')
+                
+                if not is_call and not is_put:
                     continue
                 
-                # Strike price - from ticker or parse from symbol
-                strike = float(t.get('strike_price', 0) or 0)
+                # Get strike price
+                strike = self.safe_float(t.get('strike_price'))
                 if strike == 0:
-                    # Parse from symbol: C-BTC-85000-221125
+                    # Parse from symbol: C-BTC-85000-221125 or P-ETH-2700-221125
                     parts = sym.split('-')
                     if len(parts) >= 3:
-                        try:
-                            strike = float(parts[2])
-                        except:
-                            continue
+                        strike = self.safe_float(parts[2])
                 
                 if strike == 0:
                     continue
                 
-                # Mark Price (LTP)
-                ltp = float(t.get('mark_price', 0) or 0)
+                # === CRITICAL FIX: Use correct fields ===
                 
-                # Open Interest - use oi_value_usd for USD value, or oi for contracts
-                oi = float(t.get('oi', 0) or 0)
-                oi_value = float(t.get('oi_value_usd', 0) or t.get('oi_value', 0) or 0)
+                # LTP = mark_price (not last traded, but current fair value)
+                ltp = self.safe_float(t.get('mark_price'))
                 
-                # Volume
-                vol = float(t.get('turnover_usd', 0) or t.get('turnover', 0) or 0)
+                # OI = oi_value_usd (USD value shown on website, NOT contract count)
+                # Website shows: $3.45M, $1.66M etc - this is oi_value_usd
+                oi_usd = self.safe_float(t.get('oi_value_usd') or t.get('oi_value'))
                 
-                # IV - from mark_vol or greeks
-                iv = 0
-                mark_vol = t.get('mark_vol')
-                if mark_vol:
-                    iv = float(mark_vol)
+                # Volume = turnover_usd
+                vol_usd = self.safe_float(t.get('turnover_usd') or t.get('turnover'))
                 
-                # Also check greeks
-                greeks = t.get('greeks')
-                if greeks and isinstance(greeks, dict):
-                    greek_iv = greeks.get('implied_volatility')
-                    if greek_iv:
-                        iv = float(greek_iv)
+                # IV = mark_vol (this is the IV shown on website)
+                # mark_vol is already in percentage format (95.5 = 95.5%)
+                iv = self.safe_float(t.get('mark_vol'))
                 
                 # Also check quotes for bid/ask IV
-                quotes = t.get('quotes', {})
-                if quotes:
-                    ask_iv = float(quotes.get('ask_iv', 0) or 0)
-                    bid_iv = float(quotes.get('bid_iv', 0) or 0)
+                quotes = t.get('quotes') or {}
+                if iv == 0 and quotes:
+                    ask_iv = self.safe_float(quotes.get('ask_iv'))
+                    bid_iv = self.safe_float(quotes.get('bid_iv'))
                     if ask_iv > 0 and bid_iv > 0:
-                        iv = (ask_iv + bid_iv) / 2
+                        iv = (ask_iv + bid_iv) / 2 * 100  # Convert decimal to %
                     elif ask_iv > 0:
-                        iv = ask_iv
+                        iv = ask_iv * 100
                     elif bid_iv > 0:
-                        iv = bid_iv
+                        iv = bid_iv * 100
                 
-                # IV is returned as decimal (0.95 = 95%), convert to percentage
-                if 0 < iv < 5:
-                    iv = iv * 100
-                
-                data_rows.append({
-                    'strike': strike,
-                    'type': o_type,
+                # Store data
+                data = {
                     'ltp': ltp,
-                    'oi': oi,
-                    'oi_value': oi_value,
+                    'oi': oi_usd,  # This is USD value now!
                     'iv': iv,
-                    'vol': vol
-                })
+                    'vol': vol_usd
+                }
+                
+                if is_call:
+                    calls_data[strike] = data
+                else:
+                    puts_data[strike] = data
             
-            if not data_rows:
-                logger.error("No valid data rows")
+            logger.info(f"📈 Parsed: {len(calls_data)} calls, {len(puts_data)} puts")
+            
+            if not calls_data and not puts_data:
+                logger.error("No valid options data")
                 return None, 0, ""
             
-            # 5. Create DataFrame and pivot
-            df = pd.DataFrame(data_rows)
-            logger.info(f"📈 Parsed {len(df)} options")
+            # 5. Combine into DataFrame
+            all_strikes = sorted(set(list(calls_data.keys()) + list(puts_data.keys())))
             
-            # Aggregate by strike and type
-            df_agg = df.groupby(['strike', 'type']).agg({
-                'ltp': 'first',
-                'oi': 'sum',
-                'oi_value': 'sum',
-                'vol': 'sum',
-                'iv': 'max'
-            }).reset_index()
+            rows = []
+            for strike in all_strikes:
+                c = calls_data.get(strike, {})
+                p = puts_data.get(strike, {})
+                
+                rows.append({
+                    'strike': strike,
+                    'c_vol': c.get('vol', 0),
+                    'c_oi': c.get('oi', 0),
+                    'c_iv': c.get('iv', 0),
+                    'c_ltp': c.get('ltp', 0),
+                    'p_ltp': p.get('ltp', 0),
+                    'p_iv': p.get('iv', 0),
+                    'p_oi': p.get('oi', 0),
+                    'p_vol': p.get('vol', 0)
+                })
             
-            # Pivot calls and puts
-            calls = df_agg[df_agg['type'] == 'C'].set_index('strike')
-            puts = df_agg[df_agg['type'] == 'P'].set_index('strike')
+            chain = pd.DataFrame(rows)
+            chain = chain.set_index('strike')
             
-            # Rename columns
-            calls = calls.rename(columns={
-                'ltp': 'c_ltp', 'oi': 'c_oi', 'oi_value': 'c_oi_val',
-                'vol': 'c_vol', 'iv': 'c_iv'
-            })
-            puts = puts.rename(columns={
-                'ltp': 'p_ltp', 'oi': 'p_oi', 'oi_value': 'p_oi_val',
-                'vol': 'p_vol', 'iv': 'p_iv'
-            })
-            
-            # Merge
-            chain = pd.concat([
-                calls[['c_vol', 'c_oi', 'c_iv', 'c_ltp']],
-                puts[['p_ltp', 'p_iv', 'p_oi', 'p_vol']]
-            ], axis=1)
-            
-            chain = chain.sort_index()
-            chain = chain.fillna(0)
-            
-            # 6. Filter to strikes around spot price
-            all_strikes = chain.index.tolist()
-            if not all_strikes:
-                return chain, spot_price, target_expiry.strftime('%d-%b')
-            
-            # Find ATM strike
+            # 6. Filter strikes around ATM
             atm_strike = min(all_strikes, key=lambda x: abs(x - spot_price))
             atm_idx = all_strikes.index(atm_strike)
             
-            # Get 8 strikes above and below ATM
             start_idx = max(0, atm_idx - 8)
             end_idx = min(len(all_strikes), atm_idx + 9)
-            
             filtered_strikes = all_strikes[start_idx:end_idx]
+            
             chain = chain.loc[filtered_strikes]
             
-            return chain, spot_price, target_expiry.strftime('%d-%b')
+            return chain, spot_price, expiry_dt.strftime('%d-%b')
 
         except Exception as e:
             logger.error(f"Chain Error: {e}")
@@ -297,82 +288,80 @@ class DeltaDashboard:
             traceback.print_exc()
             return None, 0, ""
 
-    # ---------------- IMAGE GENERATION ----------------
+    def format_value(self, val, is_price=False, is_iv=False):
+        """Format values like website: OI in K/M, IV as %, price with comma"""
+        if val == 0 or pd.isna(val):
+            return "-"
+        
+        if is_iv:
+            return f"{val:.1f}"
+        
+        if is_price:
+            if val >= 1000:
+                return f"{val:,.0f}"
+            elif val >= 1:
+                return f"{val:.2f}"
+            else:
+                return f"{val:.4f}"
+        
+        # OI/Volume formatting (in USD)
+        if val >= 1_000_000:
+            return f"{val/1_000_000:.2f}M"
+        elif val >= 1_000:
+            return f"{val/1_000:.1f}K"
+        else:
+            return f"{val:.0f}"
+
     def generate_dashboard(self, underlying='BTC'):
         logger.info(f"🎨 Generating Dashboard for {underlying}...")
         
         candles = self.get_candles(f"{underlying}USD")
         chain_result = self.get_chain_data(underlying)
         
-        if chain_result is None:
-            logger.error("Chain data is None")
+        if chain_result is None or chain_result[0] is None:
+            logger.error("Failed to get chain data")
             return None
             
         chain_df, spot, exp = chain_result
         
         if candles is None or chain_df is None or chain_df.empty:
-            logger.error(f"Data missing - Candles: {candles is not None}, Chain: {chain_df is not None}")
+            logger.error("Missing data for dashboard")
             return None
 
         fig = plt.figure(figsize=(14, 18))
         gs = fig.add_gridspec(2, 1, height_ratios=[1, 1.5])
 
-        # Chart
+        # Price Chart
         ax1 = fig.add_subplot(gs[0])
         mpf.plot(candles, type='candle', ax=ax1, style='yahoo', volume=False,
                  axtitle=f"{underlying} - 15m | Spot: ${spot:,.2f}")
 
-        # Table
+        # Option Chain Table
         ax2 = fig.add_subplot(gs[1])
         ax2.axis('off')
         ax2.set_title(f"OPTION CHAIN (Exp: {exp})", color='yellow', fontsize=16, pad=10)
 
         table_data = []
-        col_labels = ['Vol($)', 'OI', 'IV%', 'LTP', 'STRIKE', 'LTP', 'IV%', 'OI', 'Vol($)']
-
-        def fmt(val, is_curr=False, is_iv=False):
-            if val == 0 or pd.isna(val):
-                return "-"
-            if is_iv:
-                return f"{val:.1f}"
-            if is_curr:
-                return f"{val:,.2f}" if val < 1000 else f"{val:,.0f}"
-            if val >= 1000000:
-                return f"{val/1000000:.2f}M"
-            if val >= 1000:
-                return f"{val/1000:.1f}K"
-            return f"{val:.0f}"
+        col_labels = ['Vol($)', 'OI($)', 'IV%', 'LTP', 'STRIKE', 'LTP', 'IV%', 'OI($)', 'Vol($)']
 
         for strike in chain_df.index:
             row = chain_df.loc[strike]
             
-            # Call data
-            c_vol = row.get('c_vol', 0)
-            c_oi = row.get('c_oi', 0)
-            c_iv = row.get('c_iv', 0)
-            c_ltp = row.get('c_ltp', 0)
-            
-            # Put data
-            p_ltp = row.get('p_ltp', 0)
-            p_iv = row.get('p_iv', 0)
-            p_oi = row.get('p_oi', 0)
-            p_vol = row.get('p_vol', 0)
-            
             r = [
-                fmt(c_vol),
-                fmt(c_oi),
-                fmt(c_iv, is_iv=True),
-                fmt(c_ltp, is_curr=True),
-                f"{int(strike):,}",
-                fmt(p_ltp, is_curr=True),
-                fmt(p_iv, is_iv=True),
-                fmt(p_oi),
-                fmt(p_vol)
+                self.format_value(row['c_vol']),           # Call Volume
+                self.format_value(row['c_oi']),            # Call OI (USD)
+                self.format_value(row['c_iv'], is_iv=True), # Call IV
+                self.format_value(row['c_ltp'], is_price=True), # Call LTP
+                f"{int(strike):,}",                         # Strike
+                self.format_value(row['p_ltp'], is_price=True), # Put LTP
+                self.format_value(row['p_iv'], is_iv=True),  # Put IV
+                self.format_value(row['p_oi']),             # Put OI (USD)
+                self.format_value(row['p_vol'])             # Put Volume
             ]
             table_data.append(r)
 
         if not table_data:
-            logger.error("No table data")
+            logger.error("No table data to display")
             return None
 
         table = ax2.table(cellText=table_data, colLabels=col_labels, 
@@ -381,7 +370,7 @@ class DeltaDashboard:
         table.set_fontsize(10)
         table.scale(1.2, 2.0)
 
-        # Style the table
+        # Style table
         for (row, col), cell in table.get_celld().items():
             if row == 0:
                 cell.set_text_props(weight='bold', color='white')
@@ -391,15 +380,17 @@ class DeltaDashboard:
                 cell.set_facecolor('black')
                 cell.set_text_props(color='white')
 
+                # Highlight ATM strike
                 try:
-                    stk = float(table_data[row-1][4].replace(',', ''))
+                    stk_str = table_data[row-1][4].replace(',', '')
+                    stk = float(stk_str)
                     if abs(stk - spot) < (spot * 0.01):
                         cell.set_facecolor('#2A2A4A')
                         cell.set_text_props(color='#00FFFF', weight='bold')
                 except:
                     pass
 
-                # Color coding: Calls (green), Puts (red), Strike (yellow)
+                # Color: Calls green, Puts red, Strike yellow
                 if col < 4:
                     cell.set_text_props(color='#00FF00')
                 elif col > 4:
@@ -415,7 +406,8 @@ class DeltaDashboard:
         plt.close(fig)
         return buf
 
-# ==================== BOT RUNNER ====================
+
+# ==================== TEST & RUN ====================
 async def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN missing!")
@@ -427,57 +419,58 @@ async def main():
 
     while True:
         try:
-            # BTC Dashboard
+            # BTC
             img = dash.generate_dashboard('BTC')
             if img:
-                await bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID, 
-                    photo=img, 
-                    caption="📊 #BTC Option Chain\n💡 Data from Delta Exchange"
-                )
+                await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img,
+                    caption="📊 #BTC Option Chain\n💡 Data: Delta Exchange")
                 logger.info("✅ BTC Sent")
-            else:
-                logger.warning("⚠️ BTC dashboard generation failed")
             
             await asyncio.sleep(10)
 
-            # ETH Dashboard
+            # ETH
             img = dash.generate_dashboard('ETH')
             if img:
-                await bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID, 
-                    photo=img, 
-                    caption="📊 #ETH Option Chain\n💡 Data from Delta Exchange"
-                )
+                await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img,
+                    caption="📊 #ETH Option Chain\n💡 Data: Delta Exchange")
                 logger.info("✅ ETH Sent")
-            else:
-                logger.warning("⚠️ ETH dashboard generation failed")
 
             logger.info("💤 Waiting 2 mins...")
             await asyncio.sleep(120)
 
         except Exception as e:
             logger.error(f"Main Loop Error: {e}")
-            import traceback
-            traceback.print_exc()
             await asyncio.sleep(60)
 
+
 if __name__ == "__main__":
-    # Test mode - run once without Telegram
+    # Test mode
     if os.getenv('TEST_MODE'):
         dash = DeltaDashboard()
         
-        print("Testing BTC chain...")
+        print("=" * 50)
+        print("Testing BTC Option Chain")
+        print("=" * 50)
         chain, spot, exp = dash.get_chain_data('BTC')
         if chain is not None:
             print(f"Spot: ${spot:,.2f}, Expiry: {exp}")
-            print(chain.head(10))
+            print("\nSample data:")
+            print(chain.head(5))
+            print("\nGenerating image...")
+            img = dash.generate_dashboard('BTC')
+            if img:
+                with open('btc_test.png', 'wb') as f:
+                    f.write(img.read())
+                print("✅ Saved: btc_test.png")
         
-        print("\nTesting ETH chain...")
+        print("\n" + "=" * 50)
+        print("Testing ETH Option Chain")
+        print("=" * 50)
         chain, spot, exp = dash.get_chain_data('ETH')
         if chain is not None:
             print(f"Spot: ${spot:,.2f}, Expiry: {exp}")
-            print(chain.head(10))
+            print("\nSample data:")
+            print(chain.head(5))
     else:
         try:
             asyncio.run(main())
