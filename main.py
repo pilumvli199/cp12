@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DELTA EXCHANGE FINAL BOT (IV FIX)
-=================================
-1. Fixed Missing IV issue (Decimal vs Percentage)
-2. 31 Strikes (Deep Analysis)
-3. Corrected Layout
+DELTA EXCHANGE EXACT REPLICA BOT
+================================
+1. Dynamic Strike Steps (Matches Website exactly)
+2. Range: ATM -12 to ATM +12 (25 Rows)
+3. Data: IV, OI, Volume (USD)
 """
 
 import os
@@ -21,7 +21,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ENV Variables
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 BASE_URL = "https://api.india.delta.exchange"
@@ -35,18 +34,13 @@ class DeltaExchangeClient:
             'Content-Type': 'application/json'
         })
         self.product_map = {}
-        self.last_product_fetch = None
 
     def get_products(self):
-        if self.product_map and self.last_product_fetch:
-            if (datetime.now() - self.last_product_fetch).total_seconds() < 3600:
-                return self.product_map
-
+        """Fetch Expiry Dates Mapping"""
         try:
             url = f"{BASE_URL}/v2/products"
             params = {'contract_types': 'call_options,put_options', 'states': 'live'}
             response = self.session.get(url, params=params, timeout=10)
-            
             if response.status_code == 200:
                 data = response.json().get('result', [])
                 new_map = {}
@@ -59,7 +53,6 @@ class DeltaExchangeClient:
                         except:
                             continue
                 self.product_map = new_map
-                self.last_product_fetch = datetime.now()
                 return self.product_map
             return {}
         except:
@@ -73,112 +66,123 @@ class DeltaExchangeClient:
         except:
             return []
 
-    def get_analysis_data(self, underlying='BTC'):
+    def get_market_data(self, underlying='BTC'):
         try:
-            product_map = self.get_products()
+            # 1. Fetch Data
+            product_map = self.get_products() or self.product_map
             all_tickers = self.get_tickers()
-            if not product_map or not all_tickers: return None
+            if not all_tickers: return None
 
-            # 1. Spot Price
+            # 2. Spot Price
             perp_symbol = f"{underlying}USD"
             spot_ticker = next((t for t in all_tickers if t['symbol'] == perp_symbol), None)
             spot_price = float(spot_ticker.get('mark_price') or 0) if spot_ticker else 0
 
-            # 2. Filter Expiry
-            options_data = []
+            # 3. Filter Tickers for Nearest Expiry
+            options = []
             now = datetime.now()
+            
+            # Temporary list to find nearest expiry
+            valid_expiries = set()
+            
             for t in all_tickers:
-                if t.get('symbol') in product_map:
-                    expiry_dt = product_map[t['symbol']]
-                    if expiry_dt > now:
-                        t['expiry_dt'] = expiry_dt
-                        options_data.append(t)
+                sym = t.get('symbol')
+                if sym in product_map:
+                    exp_dt = product_map[sym]
+                    if exp_dt > now:
+                        valid_expiries.add(exp_dt)
 
-            if not options_data: return None
-            
-            unique_dates = sorted(list(set(o['expiry_dt'] for o in options_data)))
-            if not unique_dates: return None
-            nearest_exp_dt = unique_dates[0]
-            nearest_exp_str = nearest_exp_dt.strftime('%d-%m-%Y')
+            if not valid_expiries: return None
+            nearest_exp = sorted(list(valid_expiries))[0]
+            exp_str = nearest_exp.strftime('%d-%m-%Y')
 
-            # 3. Process Data
-            calls, puts = {}, {}
-            total_call_oi, total_put_oi = 0, 0
-            atm_delta = 0
-            
-            atm_strike = self.round_to_strike(spot_price, underlying)
+            # 4. Collect relevant options
+            calls = {}
+            puts = {}
+            available_strikes = set()
 
-            for opt in options_data:
-                if opt['expiry_dt'] != nearest_exp_dt: continue
-                
+            for t in all_tickers:
+                sym = t.get('symbol')
+                if sym not in product_map: continue
+                if product_map[sym] != nearest_exp: continue
+
                 try:
-                    strike = float(opt.get('strike_price', 0))
+                    strike = float(t.get('strike_price', 0))
                     if strike == 0: continue
+                    
+                    available_strikes.add(strike)
 
-                    # --- IV FIX ---
-                    greeks = opt.get('greeks', {})
-                    # Sometimes IV is missing, default to 0
+                    # Extract Data
+                    greeks = t.get('greeks', {}) or {}
                     iv = float(greeks.get('implied_volatility', 0) or 0)
-                    
-                    # If IV is like 0.45, make it 45. If it's 45, keep 45.
-                    # Usually crypto IV is > 10. If less than 1, it's decimal.
-                    if 0 < iv < 5: 
-                        iv = iv * 100
+                    if 0 < iv < 5: iv *= 100  # Fix percentage
 
-                    delta = float(greeks.get('delta', 0) or 0)
-                    oi = float(opt.get('oi', 0) or 0)
-                    
-                    # Vol Fix
-                    usd_vol = float(opt.get('turnover', 0) or 0)
+                    # Turnover (Volume in $)
+                    usd_vol = float(t.get('turnover', 0) or 0)
                     if usd_vol == 0:
-                        usd_vol = float(opt.get('volume',0)) * float(opt.get('mark_price',0))
-
-                    if 'C' in opt['symbol']: total_call_oi += oi
-                    if 'P' in opt['symbol']: total_put_oi += oi
-
-                    if strike == atm_strike and 'C' in opt['symbol']:
-                        atm_delta = delta
+                        usd_vol = float(t.get('volume',0)) * float(t.get('mark_price',0))
 
                     data = {
+                        'ltp': float(t.get('mark_price', 0)),
+                        'oi': float(t.get('oi', 0)),
                         'iv': iv,
-                        'oi': oi,
                         'vol': usd_vol
                     }
-                    
-                    c_type = opt.get('contract_type', '').lower()
-                    if 'call' in c_type or opt['symbol'].endswith('C'):
+
+                    if 'C' in sym or '_C_' in sym:
                         calls[strike] = data
-                    elif 'put' in c_type or opt['symbol'].endswith('P'):
+                    elif 'P' in sym or '_P_' in sym:
                         puts[strike] = data
                 except:
                     continue
 
+            # 5. SMART SORTING (The Fix)
+            # Instead of calculating math, we take ACTUAL strikes from API
+            sorted_strikes = sorted(list(available_strikes))
+            
+            if not sorted_strikes: return None
+
+            # Find index of strike closest to Spot Price
+            closest_strike = min(sorted_strikes, key=lambda x: abs(x - spot_price))
+            mid_index = sorted_strikes.index(closest_strike)
+
+            # Slice list to show range (e.g., 12 above, 12 below)
+            start_idx = max(0, mid_index - 10)
+            end_idx = min(len(sorted_strikes), mid_index + 11)
+            
+            selected_strikes = sorted_strikes[start_idx:end_idx]
+
+            # Calculate PCR based on visible range or total? Using Total for accuracy
+            total_put_oi = sum(p['oi'] for p in puts.values())
+            total_call_oi = sum(c['oi'] for c in calls.values())
             pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-            strikes = self.get_strike_range(atm_strike, underlying, count=15)
 
             return {
-                'u': underlying, 'spot': spot_price, 'atm': atm_strike, 'exp': nearest_exp_str,
-                'pcr': pcr, 'atm_delta': atm_delta,
-                'calls': {k: calls[k] for k in strikes if k in calls},
-                'puts': {k: puts[k] for k in strikes if k in puts}
+                'u': underlying, 
+                'spot': spot_price, 
+                'atm': closest_strike, 
+                'exp': exp_str,
+                'pcr': pcr,
+                'strikes': selected_strikes,
+                'calls': calls,
+                'puts': puts
             }
 
         except Exception as e:
             logger.error(f"Logic Error: {e}")
             return None
 
-    def round_to_strike(self, price, underlying):
-        step = 1000 if underlying == 'BTC' else 100
-        return round(price / step) * step
-
-    def get_strike_range(self, atm, underlying, count=15):
-        step = 1000 if underlying == 'BTC' else 100
-        return [atm + (i * step) for i in range(-count, count + 1)]
-
 # ==================== FORMATTER ====================
 class TelegramFormatter:
     @staticmethod
-    def compact_num(num):
+    def fmt_num(num, is_price=False):
+        if num is None: return "-"
+        if num == 0: return "0"
+        
+        if is_price:
+            # For prices < 100, show decimals, else int
+            return f"{num:.1f}" if num < 500 else f"{num:.0f}"
+            
         if num >= 1000000: return f"{num/1000000:.1f}m"
         if num >= 1000: return f"{num/1000:.0f}k"
         return f"{num:.0f}"
@@ -187,50 +191,56 @@ class TelegramFormatter:
         if not data: return None
         
         u, spot, atm = data['u'], data['spot'], data['atm']
-        pcr = data['pcr']
+        strikes = data['strikes']
         
         trend = "Neutral ⚖️"
-        if pcr > 1.0: trend = "Bullish 🟢"
-        elif pcr < 0.65: trend = "Bearish 🔴"
+        if data['pcr'] > 1.0: trend = "Bullish 🟢"
+        elif data['pcr'] < 0.65: trend = "Bearish 🔴"
 
-        msg = f"📊 <b>{u} DEEP CHAIN (31 Strikes)</b>\n"
-        msg += f"🎯 Spot: <b>{spot:,.0f}</b> | Delta: <b>{data['atm_delta']:.2f}</b>\n"
-        msg += f"⚖️ PCR: <b>{pcr:.2f}</b> ({trend})\n"
+        # Header
+        msg = f"📊 <b>{u} LIVE CHAIN</b>\n"
+        msg += f"🎯 Spot: <b>{spot:,.0f}</b>\n"
+        msg += f"⚖️ PCR: <b>{data['pcr']:.2f}</b> ({trend})\n"
         msg += f"📅 Exp: <b>{data['exp']}</b>\n"
+        
         msg += "─" * 32 + "\n"
-        msg += "<b> CALLS (Vol/OI/IV) | PUTS (IV/OI/Vol)</b>\n"
-        msg += "<code> Vol  OI IV | IV OI  Vol </code>\n"
+        # Header matching screenshot logic roughly
+        # IV | OI | LTP || LTP | OI | IV
+        msg += "<b> CALLS (IV/OI)  |  PUTS (OI/IV)</b>\n"
+        msg += "<code> IV   OI   LTP | LTP   OI   IV </code>\n"
         msg += "─" * 32 + "\n"
 
-        strikes = sorted(set(list(data['calls'].keys()) + list(data['puts'].keys())))
-        
         for k in strikes:
             c = data['calls'].get(k, {})
             p = data['puts'].get(k, {})
             
-            cv = self.compact_num(c.get('vol', 0))
-            co = self.compact_num(c.get('oi', 0))
+            # Calls Data
+            c_iv = f"{int(c.get('iv', 0))}" if c.get('iv') else "-"
+            c_oi = self.fmt_num(c.get('oi', 0))
+            c_ltp = self.fmt_num(c.get('ltp', 0), is_price=True)
             
-            # Fix Display of IV: Show 0 if 0, don't show '-' unless None
-            ci_val = c.get('iv', 0)
-            pi_val = p.get('iv', 0)
-            
-            ci = f"{int(ci_val)}" if ci_val > 0 else "-"
-            pi = f"{int(pi_val)}" if pi_val > 0 else "-"
-            
-            po = self.compact_num(p.get('oi', 0))
-            pv = self.compact_num(p.get('vol', 0))
+            # Puts Data
+            p_ltp = self.fmt_num(p.get('ltp', 0), is_price=True)
+            p_oi = self.fmt_num(p.get('oi', 0))
+            p_iv = f"{int(p.get('iv', 0))}" if p.get('iv') else "-"
 
-            marker = "🔹" if k == atm else " "
-            st_lbl = f"{k/1000:.0f}k" if u == 'BTC' else f"{k:.0f}"
+            # ATM Marker
+            marker = "🔹" if k == atm else "  "
+            
+            # Strike Label (Keep clean: 78000 -> 78k, 2600 -> 2600)
+            if k >= 10000: # BTC
+                st_lbl = f"{k/1000:.1f}k"
+            else: # ETH
+                st_lbl = f"{k:.0f}"
 
-            # Adjust spacing slightly for better fit
-            row = f"{cv:>4} {co:>3} {ci:>2}|{pi:<2} {po:<3} {pv:<4}"
+            # Row Construction
+            # Space allocation: 
+            # IV(3) OI(4) LTP(5) | LTP(5) OI(4) IV(3)
+            row = f"{c_iv:>3} {c_oi:>4} {c_ltp:>5}|{p_ltp:<5} {p_oi:<4} {p_iv:<3}"
             
             msg += f"<code>{row}</code>{marker}<b>{st_lbl}</b>\n"
 
         msg += "─" * 32 + "\n"
-        msg += "<i>Vol in USD ($) | IV in %</i>"
         return msg
 
 # ==================== RUNNER ====================
@@ -244,25 +254,28 @@ async def main():
     fmt = TelegramFormatter()
     
     client.get_products()
-    logger.info("🚀 Deep Analysis Bot Started...")
+    logger.info("🚀 Exact Match Bot Started...")
     
     while True:
         try:
-            data = client.get_analysis_data('BTC')
-            if data:
-                await bot.send_message(TELEGRAM_CHAT_ID, fmt.generate_message(data), parse_mode='HTML')
-                logger.info("✅ BTC Sent")
-            
-            await asyncio.sleep(5)
+            # Fetch BTC
+            data_btc = client.get_market_data('BTC')
+            if data_btc:
+                await bot.send_message(TELEGRAM_CHAT_ID, fmt.generate_message(data_btc), parse_mode='HTML')
+                logger.info("✅ BTC Update")
 
-            data = client.get_analysis_data('ETH')
-            if data:
-                await bot.send_message(TELEGRAM_CHAT_ID, fmt.generate_message(data), parse_mode='HTML')
-                logger.info("✅ ETH Sent")
+            await asyncio.sleep(3)
+
+            # Fetch ETH
+            data_eth = client.get_market_data('ETH')
+            if data_eth:
+                await bot.send_message(TELEGRAM_CHAT_ID, fmt.generate_message(data_eth), parse_mode='HTML')
+                logger.info("✅ ETH Update")
 
         except Exception as e:
-            logger.error(f"⚠️ Error: {e}")
+            logger.error(f"⚠️ Main Loop Error: {e}")
         
+        logger.info("💤 Sleeping 60s...")
         await asyncio.sleep(60)
 
 if __name__ == "__main__":
