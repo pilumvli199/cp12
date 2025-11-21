@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DELTA EXCHANGE DASHBOARD (BUG FIXED)
-====================================
-1. Fixes 'Reindexing' error (Duplicate Strikes)
-2. Fixes 'Style' error (MPLFinance)
-3. Generates Image with Chart + Table
+DELTA EXCHANGE DASHBOARD (FINAL MERGE FIX)
+==========================================
+1. Solves BTC Misalignment (Using Outer Merge)
+2. Fixes IV % display
+3. Generates accurate PNG
 """
 
 import os
@@ -27,7 +27,6 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 BASE_URL = "https://api.india.delta.exchange"
 
-# Dark Background for Plots
 plt.style.use('dark_background')
 
 class DeltaDashboard:
@@ -70,15 +69,11 @@ class DeltaDashboard:
                 df.set_index('time', inplace=True)
                 df = df.sort_index()
                 
-                # Convert cols to float
                 cols = ['open', 'high', 'low', 'close', 'volume']
                 df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
-                
                 return df.tail(count)
             return None
-        except Exception as e:
-            logger.error(f"Candle Error: {e}")
-            return None
+        except: return None
 
     def get_chain_data(self, underlying='BTC'):
         try:
@@ -104,8 +99,10 @@ class DeltaDashboard:
             if not valid_dates: return None
             nearest_exp = sorted(list(set(valid_dates)))[0]
 
-            # 4. Build Rows
-            rows = []
+            # 4. Separate Calls and Puts Lists
+            calls_list = []
+            puts_list = []
+
             for t in all_tickers:
                 sym = t['symbol']
                 if sym not in product_map: continue
@@ -115,53 +112,72 @@ class DeltaDashboard:
                 strike = float(t.get('strike_price', 0))
                 if strike == 0: continue
 
-                # Calculate USD Volume (Turnover)
+                # Calculate Data
                 vol_qty = float(t.get('volume', 0) or 0)
                 mark_price = float(t.get('mark_price', 0) or 0)
                 vol_usd = float(t.get('turnover', 0) or (vol_qty * mark_price))
 
+                # IV Fix: Just take the raw value first
                 iv = float(t.get('greeks', {}).get('implied_volatility', 0) or 0)
-                if 0 < iv < 5: iv *= 100
-
-                row = {
+                
+                data = {
                     'strike': strike,
-                    'type': 'C' if 'C' in sym else 'P',
                     'ltp': mark_price,
                     'oi': float(t.get('oi', 0) or 0),
                     'iv': iv,
                     'vol': vol_usd
                 }
-                rows.append(row)
 
-            df = pd.DataFrame(rows)
-            if df.empty: return None
+                if 'C' in sym or '_C_' in sym:
+                    calls_list.append(data)
+                elif 'P' in sym or '_P_' in sym:
+                    puts_list.append(data)
 
-            # --- FIX 1: Remove Duplicates (The Reindexing Error Fix) ---
-            # Keep the one with higher OI if duplicates exist
-            df = df.sort_values(by='oi', ascending=False)
-            df = df.drop_duplicates(subset=['strike', 'type'])
-            df = df.sort_values(by='strike')
+            # 5. Create DataFrames & Merge (THE FIX)
+            df_c = pd.DataFrame(calls_list)
+            df_p = pd.DataFrame(puts_list)
 
-            # 5. Separate Calls & Puts
-            calls = df[df['type'] == 'C'].set_index('strike')
-            puts = df[df['type'] == 'P'].set_index('strike')
+            if df_c.empty and df_p.empty: return None, 0, ""
 
-            # Combine
-            chain = pd.concat([calls, puts], axis=1, keys=['Call', 'Put'])
-            chain = chain.sort_index()
+            # Drop duplicates if any (keep highest OI)
+            if not df_c.empty:
+                df_c = df_c.sort_values('oi', ascending=False).drop_duplicates('strike')
+            if not df_p.empty:
+                df_p = df_p.sort_values('oi', ascending=False).drop_duplicates('strike')
+
+            # MERGE on Strike (Outer Join) - This aligns BTC perfectly
+            if not df_c.empty and not df_p.empty:
+                chain = pd.merge(df_c, df_p, on='strike', how='outer', suffixes=('_c', '_p'))
+            elif not df_c.empty:
+                chain = df_c.rename(columns=lambda x: x + '_c' if x != 'strike' else x)
+                for col in ['ltp_p', 'oi_p', 'iv_p', 'vol_p']: chain[col] = 0
+            else:
+                chain = df_p.rename(columns=lambda x: x + '_p' if x != 'strike' else x)
+                for col in ['ltp_c', 'oi_c', 'iv_c', 'vol_c']: chain[col] = 0
+
+            # Fill NaNs with 0
+            chain = chain.fillna(0)
+            chain = chain.sort_values('strike')
 
             # 6. Filter Range (ATM +/- 8)
-            # Find closest strike to spot
-            idx = (chain.index.to_series() - spot_price).abs().idxmin()
+            idx = (chain['strike'] - spot_price).abs().idxmin()
             try:
+                # Get integer location
                 loc = chain.index.get_loc(idx)
+                # If loc is an array (rare duplicate), take first
+                if isinstance(loc, slice): loc = loc.start
+                if isinstance(loc, pd.Index): loc = loc[0]
+                
+                # Determine rows (ensure integer)
+                loc = int(loc)
                 start = max(0, loc - 8)
                 end = min(len(chain), loc + 9)
+                
                 final_df = chain.iloc[start:end].copy()
-            except:
-                final_df = chain.iloc[:16].copy() # Fallback
-
-            return final_df, spot_price, nearest_exp.strftime('%d-%b')
+                return final_df, spot_price, nearest_exp.strftime('%d-%b')
+            except Exception as e:
+                logger.error(f"Slicing Error: {e}")
+                return chain.head(16), spot_price, nearest_exp.strftime('%d-%b')
 
         except Exception as e:
             logger.error(f"Chain Error: {e}")
@@ -174,23 +190,17 @@ class DeltaDashboard:
         candles = self.get_candles(f"{underlying}USD")
         chain_df, spot, exp = self.get_chain_data(underlying)
         
-        if candles is None or chain_df is None: 
-            logger.warning(f"⚠️ Data missing for {underlying}")
-            return None
+        if candles is None or chain_df is None: return None
 
-        # Layout: Top for Chart, Bottom for Table
         fig = plt.figure(figsize=(12, 16))
         gs = fig.add_gridspec(2, 1, height_ratios=[1, 1.4])
 
-        # --- PLOT 1: CHART ---
+        # Chart
         ax1 = fig.add_subplot(gs[0])
-        
-        # --- FIX 2: Simple Style (Fixes 'Unrecognized kwarg' Error) ---
-        # Using 'yahoo' style which is built-in and robust
         mpf.plot(candles, type='candle', ax=ax1, style='yahoo', volume=False,
                  axtitle=f"{underlying} - 15m | Spot: ${spot:,.0f}")
 
-        # --- PLOT 2: TABLE ---
+        # Table
         ax2 = fig.add_subplot(gs[1])
         ax2.axis('off')
         ax2.set_title(f"OPTION CHAIN (Exp: {exp})", color='yellow', fontsize=16, pad=10)
@@ -198,33 +208,35 @@ class DeltaDashboard:
         table_data = []
         col_labels = ['Vol($)', 'OI', 'IV%', 'LTP', 'STRIKE', 'LTP', 'IV%', 'OI', 'Vol($)']
 
-        for strike, row in chain_df.iterrows():
+        for _, row in chain_df.iterrows():
             def fmt(val, is_curr=False):
-                if pd.isna(val): return "-"
+                if val == 0: return "-"
                 if is_curr: return f"{val:,.0f}"
                 if val > 1000000: return f"{val/1000000:.1f}M"
                 if val > 1000: return f"{val/1000:.0f}K"
                 return f"{int(val)}"
 
-            c = row['Call']
-            p = row['Put']
+            # IV Logic: If < 1, multiply by 100. If > 1, keep as is.
+            iv_c = row['iv_c']
+            if 0 < iv_c < 2: iv_c *= 100
+            
+            iv_p = row['iv_p']
+            if 0 < iv_p < 2: iv_p *= 100
 
             r = [
-                fmt(c.get('vol', 0)), fmt(c.get('oi', 0)), fmt(c.get('iv', 0)), fmt(c.get('ltp', 0), True),
-                f"{int(strike)}",
-                fmt(p.get('ltp', 0), True), fmt(p.get('iv', 0)), fmt(p.get('oi', 0)), fmt(p.get('vol', 0))
+                fmt(row['vol_c']), fmt(row['oi_c']), fmt(iv_c), fmt(row['ltp_c'], True),
+                f"{int(row['strike'])}",
+                fmt(row['ltp_p'], True), fmt(iv_p), fmt(row['oi_p']), fmt(row['vol_p'])
             ]
             table_data.append(r)
 
-        # Draw Table
         table = ax2.table(cellText=table_data, colLabels=col_labels, loc='center', cellLoc='center')
         table.auto_set_font_size(False)
         table.set_fontsize(11)
-        table.scale(1, 2.0) # Taller rows
+        table.scale(1, 2.0)
 
-        # Styling
         for (row, col), cell in table.get_celld().items():
-            if row == 0: # Header
+            if row == 0:
                 cell.set_text_props(weight='bold', color='white')
                 cell.set_facecolor('#333333')
             else:
@@ -232,7 +244,6 @@ class DeltaDashboard:
                 cell.set_facecolor('black')
                 cell.set_text_props(color='white')
 
-                # Highlight ATM
                 try:
                     stk = float(table_data[row-1][4])
                     if abs(stk - spot) < (spot * 0.005):
@@ -240,10 +251,9 @@ class DeltaDashboard:
                         cell.set_text_props(color='#00FFFF', weight='bold')
                 except: pass
 
-                # Green Calls / Red Puts
-                if col < 4: cell.set_text_props(color='#00FF00') # Green
-                elif col > 4: cell.set_text_props(color='#FF5555') # Red
-                elif col == 4: cell.set_text_props(color='yellow', weight='bold') # Strike
+                if col < 4: cell.set_text_props(color='#00FF00')
+                elif col > 4: cell.set_text_props(color='#FF5555')
+                elif col == 4: cell.set_text_props(color='yellow', weight='bold')
 
         buf = BytesIO()
         plt.tight_layout()
