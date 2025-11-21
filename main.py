@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DELTA EXCHANGE DASHBOARD (FINAL MERGE FIX)
-==========================================
-1. Solves BTC Misalignment (Using Outer Merge)
-2. Fixes IV % display
-3. Generates accurate PNG
+DELTA EXCHANGE DASHBOARD (ROOT CAUSE FIXED)
+===========================================
+1. Fixed 'BTC' string bug (Puts were identified as Calls)
+2. Fixed IV fetching logic
+3. Accurate Data Alignment
 """
 
 import os
@@ -99,7 +99,7 @@ class DeltaDashboard:
             if not valid_dates: return None
             nearest_exp = sorted(list(set(valid_dates)))[0]
 
-            # 4. Separate Calls and Puts Lists
+            # 4. Separate Calls and Puts Lists (FIXED LOGIC)
             calls_list = []
             puts_list = []
 
@@ -112,14 +112,17 @@ class DeltaDashboard:
                 strike = float(t.get('strike_price', 0))
                 if strike == 0: continue
 
-                # Calculate Data
+                # Extract Data
                 vol_qty = float(t.get('volume', 0) or 0)
                 mark_price = float(t.get('mark_price', 0) or 0)
                 vol_usd = float(t.get('turnover', 0) or (vol_qty * mark_price))
-
-                # IV Fix: Just take the raw value first
-                iv = float(t.get('greeks', {}).get('implied_volatility', 0) or 0)
                 
+                # IV Fetching
+                greeks = t.get('greeks')
+                iv = 0
+                if greeks and isinstance(greeks, dict):
+                    iv = float(greeks.get('implied_volatility', 0) or 0)
+
                 data = {
                     'strike': strike,
                     'ltp': mark_price,
@@ -128,24 +131,33 @@ class DeltaDashboard:
                     'vol': vol_usd
                 }
 
-                if 'C' in sym or '_C_' in sym:
+                # --- THE FIX: Use contract_type instead of string matching ---
+                c_type = t.get('contract_type', '').lower()
+                
+                if c_type == 'call_options':
                     calls_list.append(data)
-                elif 'P' in sym or '_P_' in sym:
+                elif c_type == 'put_options':
                     puts_list.append(data)
+                else:
+                    # Fallback if contract_type is missing
+                    if '_C' in sym or sym.endswith('C'):
+                        calls_list.append(data)
+                    elif '_P' in sym or sym.endswith('P'):
+                        puts_list.append(data)
 
-            # 5. Create DataFrames & Merge (THE FIX)
+            # 5. Create DataFrames & Merge
             df_c = pd.DataFrame(calls_list)
             df_p = pd.DataFrame(puts_list)
 
             if df_c.empty and df_p.empty: return None, 0, ""
 
-            # Drop duplicates if any (keep highest OI)
+            # Remove duplicates (keep highest OI)
             if not df_c.empty:
                 df_c = df_c.sort_values('oi', ascending=False).drop_duplicates('strike')
             if not df_p.empty:
                 df_p = df_p.sort_values('oi', ascending=False).drop_duplicates('strike')
 
-            # MERGE on Strike (Outer Join) - This aligns BTC perfectly
+            # MERGE (Outer Join to keep both sides even if one is missing)
             if not df_c.empty and not df_p.empty:
                 chain = pd.merge(df_c, df_p, on='strike', how='outer', suffixes=('_c', '_p'))
             elif not df_c.empty:
@@ -155,28 +167,24 @@ class DeltaDashboard:
                 chain = df_p.rename(columns=lambda x: x + '_p' if x != 'strike' else x)
                 for col in ['ltp_c', 'oi_c', 'iv_c', 'vol_c']: chain[col] = 0
 
-            # Fill NaNs with 0
             chain = chain.fillna(0)
             chain = chain.sort_values('strike')
 
             # 6. Filter Range (ATM +/- 8)
             idx = (chain['strike'] - spot_price).abs().idxmin()
             try:
-                # Get integer location
                 loc = chain.index.get_loc(idx)
-                # If loc is an array (rare duplicate), take first
+                # Handle potential duplicate index issue
                 if isinstance(loc, slice): loc = loc.start
-                if isinstance(loc, pd.Index): loc = loc[0]
+                if hasattr(loc, '__iter__'): loc = loc[0]
                 
-                # Determine rows (ensure integer)
                 loc = int(loc)
                 start = max(0, loc - 8)
                 end = min(len(chain), loc + 9)
                 
                 final_df = chain.iloc[start:end].copy()
                 return final_df, spot_price, nearest_exp.strftime('%d-%b')
-            except Exception as e:
-                logger.error(f"Slicing Error: {e}")
+            except:
                 return chain.head(16), spot_price, nearest_exp.strftime('%d-%b')
 
         except Exception as e:
@@ -216,12 +224,12 @@ class DeltaDashboard:
                 if val > 1000: return f"{val/1000:.0f}K"
                 return f"{int(val)}"
 
-            # IV Logic: If < 1, multiply by 100. If > 1, keep as is.
+            # IV Handling
             iv_c = row['iv_c']
-            if 0 < iv_c < 2: iv_c *= 100
+            if 0 < iv_c < 5: iv_c *= 100 # Convert 0.5 to 50%
             
             iv_p = row['iv_p']
-            if 0 < iv_p < 2: iv_p *= 100
+            if 0 < iv_p < 5: iv_p *= 100
 
             r = [
                 fmt(row['vol_c']), fmt(row['oi_c']), fmt(iv_c), fmt(row['ltp_c'], True),
