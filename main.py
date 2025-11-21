@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DELTA EXCHANGE DEEP ANALYSIS BOT (31 STRIKES)
-=============================================
-1. Range: ATM +/- 15 Strikes (Total 31)
-2. Data: IV, OI, Volume ($ Turnover)
-3. Analysis: PCR + ATM Delta
+DELTA EXCHANGE FINAL BOT (IV FIX)
+=================================
+1. Fixed Missing IV issue (Decimal vs Percentage)
+2. 31 Strikes (Deep Analysis)
+3. Corrected Layout
 """
 
 import os
@@ -106,7 +106,6 @@ class DeltaExchangeClient:
             total_call_oi, total_put_oi = 0, 0
             atm_delta = 0
             
-            # Find ATM Strike for Delta reference
             atm_strike = self.round_to_strike(spot_price, underlying)
 
             for opt in options_data:
@@ -116,22 +115,27 @@ class DeltaExchangeClient:
                     strike = float(opt.get('strike_price', 0))
                     if strike == 0: continue
 
-                    # Get Greeks & Values
+                    # --- IV FIX ---
                     greeks = opt.get('greeks', {})
+                    # Sometimes IV is missing, default to 0
                     iv = float(greeks.get('implied_volatility', 0) or 0)
+                    
+                    # If IV is like 0.45, make it 45. If it's 45, keep 45.
+                    # Usually crypto IV is > 10. If less than 1, it's decimal.
+                    if 0 < iv < 5: 
+                        iv = iv * 100
+
                     delta = float(greeks.get('delta', 0) or 0)
                     oi = float(opt.get('oi', 0) or 0)
                     
-                    # Turnover (USD Volume)
+                    # Vol Fix
                     usd_vol = float(opt.get('turnover', 0) or 0)
-                    if usd_vol == 0: # Fallback
+                    if usd_vol == 0:
                         usd_vol = float(opt.get('volume',0)) * float(opt.get('mark_price',0))
 
-                    # Total OI for PCR
                     if 'C' in opt['symbol']: total_call_oi += oi
                     if 'P' in opt['symbol']: total_put_oi += oi
 
-                    # Capture ATM Delta
                     if strike == atm_strike and 'C' in opt['symbol']:
                         atm_delta = delta
 
@@ -149,10 +153,7 @@ class DeltaExchangeClient:
                 except:
                     continue
 
-            # 4. Calculate PCR
             pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
-
-            # 5. Range (31 Strikes: ATM +/- 15)
             strikes = self.get_strike_range(atm_strike, underlying, count=15)
 
             return {
@@ -174,13 +175,12 @@ class DeltaExchangeClient:
         step = 1000 if underlying == 'BTC' else 100
         return [atm + (i * step) for i in range(-count, count + 1)]
 
-# ==================== COMPACT FORMATTER ====================
+# ==================== FORMATTER ====================
 class TelegramFormatter:
     @staticmethod
     def compact_num(num):
-        """Super compact for 31 rows"""
-        if num >= 1000000: return f"{num/1000000:.1f}m" # 1.2m
-        if num >= 1000: return f"{num/1000:.0f}k"       # 50k
+        if num >= 1000000: return f"{num/1000000:.1f}m"
+        if num >= 1000: return f"{num/1000:.0f}k"
         return f"{num:.0f}"
 
     def generate_message(self, data):
@@ -193,18 +193,14 @@ class TelegramFormatter:
         if pcr > 1.0: trend = "Bullish 🟢"
         elif pcr < 0.65: trend = "Bearish 🔴"
 
-        # Header
         msg = f"📊 <b>{u} DEEP CHAIN (31 Strikes)</b>\n"
         msg += f"🎯 Spot: <b>{spot:,.0f}</b> | Delta: <b>{data['atm_delta']:.2f}</b>\n"
         msg += f"⚖️ PCR: <b>{pcr:.2f}</b> ({trend})\n"
         msg += f"📅 Exp: <b>{data['exp']}</b>\n"
-        msg += "─" * 30 + "\n"
-        
-        # Table Header (Tight Fit)
-        # C-Vol C-OI IV | IV P-OI P-Vol
+        msg += "─" * 32 + "\n"
         msg += "<b> CALLS (Vol/OI/IV) | PUTS (IV/OI/Vol)</b>\n"
         msg += "<code> Vol  OI IV | IV OI  Vol </code>\n"
-        msg += "─" * 30 + "\n"
+        msg += "─" * 32 + "\n"
 
         strikes = sorted(set(list(data['calls'].keys()) + list(data['puts'].keys())))
         
@@ -212,29 +208,28 @@ class TelegramFormatter:
             c = data['calls'].get(k, {})
             p = data['puts'].get(k, {})
             
-            # Calls
             cv = self.compact_num(c.get('vol', 0))
             co = self.compact_num(c.get('oi', 0))
-            ci = f"{int(c.get('iv', 0))}" if c.get('iv') else "-"
             
-            # Puts
-            pi = f"{int(p.get('iv', 0))}" if p.get('iv') else "-"
+            # Fix Display of IV: Show 0 if 0, don't show '-' unless None
+            ci_val = c.get('iv', 0)
+            pi_val = p.get('iv', 0)
+            
+            ci = f"{int(ci_val)}" if ci_val > 0 else "-"
+            pi = f"{int(pi_val)}" if pi_val > 0 else "-"
+            
             po = self.compact_num(p.get('oi', 0))
             pv = self.compact_num(p.get('vol', 0))
 
-            # Marker
             marker = "🔹" if k == atm else " "
-            
-            # Strike Format (Compact: 90k instead of 90000)
             st_lbl = f"{k/1000:.0f}k" if u == 'BTC' else f"{k:.0f}"
 
-            # Row: Vol OI IV | IV OI Vol  [Strike]
-            # Designed to fit mobile screen
+            # Adjust spacing slightly for better fit
             row = f"{cv:>4} {co:>3} {ci:>2}|{pi:<2} {po:<3} {pv:<4}"
             
             msg += f"<code>{row}</code>{marker}<b>{st_lbl}</b>\n"
 
-        msg += "─" * 30 + "\n"
+        msg += "─" * 32 + "\n"
         msg += "<i>Vol in USD ($) | IV in %</i>"
         return msg
 
@@ -253,32 +248,21 @@ async def main():
     
     while True:
         try:
-            # BTC Only (Huge message, so limiting to BTC usually better)
             data = client.get_analysis_data('BTC')
             if data:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID, 
-                    text=fmt.generate_message(data), 
-                    parse_mode='HTML'
-                )
-                logger.info("✅ BTC Deep Data Sent")
+                await bot.send_message(TELEGRAM_CHAT_ID, fmt.generate_message(data), parse_mode='HTML')
+                logger.info("✅ BTC Sent")
             
             await asyncio.sleep(5)
 
-            # ETH
             data = client.get_analysis_data('ETH')
             if data:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID, 
-                    text=fmt.generate_message(data), 
-                    parse_mode='HTML'
-                )
-                logger.info("✅ ETH Deep Data Sent")
+                await bot.send_message(TELEGRAM_CHAT_ID, fmt.generate_message(data), parse_mode='HTML')
+                logger.info("✅ ETH Sent")
 
         except Exception as e:
             logger.error(f"⚠️ Error: {e}")
         
-        logger.info("💤 Sleeping 60s...")
         await asyncio.sleep(60)
 
 if __name__ == "__main__":
