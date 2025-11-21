@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-DELTA EXCHANGE OPTION CHAIN BOT (FINAL USD FIX)
-===============================================
-1. Shows Volume in USD ($) to match Website
-2. Uses Turnover instead of Quantity
-3. Auto Expiry & Rate Limit Handling
+DELTA EXCHANGE DEEP ANALYSIS BOT (31 STRIKES)
+=============================================
+1. Range: ATM +/- 15 Strikes (Total 31)
+2. Data: IV, OI, Volume ($ Turnover)
+3. Analysis: PCR + ATM Delta
 """
 
 import os
@@ -38,7 +38,6 @@ class DeltaExchangeClient:
         self.last_product_fetch = None
 
     def get_products(self):
-        """Fetch Expiry Dates"""
         if self.product_map and self.last_product_fetch:
             if (datetime.now() - self.last_product_fetch).total_seconds() < 3600:
                 return self.product_map
@@ -61,104 +60,104 @@ class DeltaExchangeClient:
                             continue
                 self.product_map = new_map
                 self.last_product_fetch = datetime.now()
-                logger.info(f"📚 Loaded {len(new_map)} products")
                 return self.product_map
             return {}
-        except Exception as e:
-            logger.error(f"❌ Product Fetch Error: {e}")
+        except:
             return {}
 
     def get_tickers(self):
-        """Fetch Live Tickers"""
         try:
             url = f"{BASE_URL}/v2/tickers"
             response = self.session.get(url, timeout=10)
-            if response.status_code == 200:
-                return response.json().get('result', [])
-            return []
-        except Exception as e:
-            logger.error(f"❌ Ticker Fetch Error: {e}")
+            return response.json().get('result', []) if response.status_code == 200 else []
+        except:
             return []
 
-    def get_option_chain_data(self, underlying='BTC'):
+    def get_analysis_data(self, underlying='BTC'):
         try:
-            # 1. Get Expiry Data
             product_map = self.get_products()
-            if not product_map: return None
-
-            # 2. Get Live Data
             all_tickers = self.get_tickers()
-            if not all_tickers: return None
+            if not product_map or not all_tickers: return None
 
-            # 3. Find Spot Price
+            # 1. Spot Price
             perp_symbol = f"{underlying}USD"
             spot_ticker = next((t for t in all_tickers if t['symbol'] == perp_symbol), None)
             spot_price = float(spot_ticker.get('mark_price') or 0) if spot_ticker else 0
 
-            # 4. Merge & Filter
+            # 2. Filter Expiry
             options_data = []
             now = datetime.now()
-
             for t in all_tickers:
-                sym = t.get('symbol')
-                if sym in product_map:
-                    expiry_dt = product_map[sym]
+                if t.get('symbol') in product_map:
+                    expiry_dt = product_map[t['symbol']]
                     if expiry_dt > now:
                         t['expiry_dt'] = expiry_dt
                         options_data.append(t)
 
             if not options_data: return None
-
-            # 5. Nearest Expiry
+            
             unique_dates = sorted(list(set(o['expiry_dt'] for o in options_data)))
             if not unique_dates: return None
-            nearest_expiry_dt = unique_dates[0]
-            nearest_expiry_str = nearest_expiry_dt.strftime('%d-%m-%Y')
+            nearest_exp_dt = unique_dates[0]
+            nearest_exp_str = nearest_exp_dt.strftime('%d-%m-%Y')
 
-            # 6. Extract Data (CONVERTING VOL TO TURNOVER/USD)
+            # 3. Process Data
             calls, puts = {}, {}
+            total_call_oi, total_put_oi = 0, 0
+            atm_delta = 0
             
+            # Find ATM Strike for Delta reference
+            atm_strike = self.round_to_strike(spot_price, underlying)
+
             for opt in options_data:
-                if opt['expiry_dt'] != nearest_expiry_dt:
-                    continue
+                if opt['expiry_dt'] != nearest_exp_dt: continue
                 
                 try:
                     strike = float(opt.get('strike_price', 0))
                     if strike == 0: continue
-                    
-                    # --- MAIN FIX HERE ---
-                    # Use 'turnover' if available (USD value), else volume * price
-                    # Delta API typically returns 'turnover' or 'turnover_24h' for USD volume
-                    usd_vol = float(opt.get('turnover', 0) or 0)
-                    
-                    # If turnover is 0 but volume exists, approximate it
-                    if usd_vol == 0:
-                         qty_vol = float(opt.get('volume', 0) or 0)
-                         mark_p = float(opt.get('mark_price', 0) or 0)
-                         usd_vol = qty_vol * mark_p
 
-                    c_type = opt.get('contract_type', '').lower()
-                    is_call = 'call' in c_type or opt['symbol'].endswith('C')
-                    is_put = 'put' in c_type or opt['symbol'].endswith('P')
+                    # Get Greeks & Values
+                    greeks = opt.get('greeks', {})
+                    iv = float(greeks.get('implied_volatility', 0) or 0)
+                    delta = float(greeks.get('delta', 0) or 0)
+                    oi = float(opt.get('oi', 0) or 0)
+                    
+                    # Turnover (USD Volume)
+                    usd_vol = float(opt.get('turnover', 0) or 0)
+                    if usd_vol == 0: # Fallback
+                        usd_vol = float(opt.get('volume',0)) * float(opt.get('mark_price',0))
+
+                    # Total OI for PCR
+                    if 'C' in opt['symbol']: total_call_oi += oi
+                    if 'P' in opt['symbol']: total_put_oi += oi
+
+                    # Capture ATM Delta
+                    if strike == atm_strike and 'C' in opt['symbol']:
+                        atm_delta = delta
 
                     data = {
-                        'ltp': float(opt.get('mark_price', 0) or 0),
-                        'oi': float(opt.get('oi', 0) or 0),
-                        'volume': usd_vol  # Storing USD Value here
+                        'iv': iv,
+                        'oi': oi,
+                        'vol': usd_vol
                     }
                     
-                    if is_call: calls[strike] = data
-                    elif is_put: puts[strike] = data
-
+                    c_type = opt.get('contract_type', '').lower()
+                    if 'call' in c_type or opt['symbol'].endswith('C'):
+                        calls[strike] = data
+                    elif 'put' in c_type or opt['symbol'].endswith('P'):
+                        puts[strike] = data
                 except:
                     continue
 
-            # 7. Range
-            atm = self.round_to_strike(spot_price, underlying)
-            strikes = self.get_strike_range(atm, underlying, count=5)
-            
+            # 4. Calculate PCR
+            pcr = total_put_oi / total_call_oi if total_call_oi > 0 else 0
+
+            # 5. Range (31 Strikes: ATM +/- 15)
+            strikes = self.get_strike_range(atm_strike, underlying, count=15)
+
             return {
-                'u': underlying, 'spot': spot_price, 'atm': atm, 'exp': nearest_expiry_str,
+                'u': underlying, 'spot': spot_price, 'atm': atm_strike, 'exp': nearest_exp_str,
+                'pcr': pcr, 'atm_delta': atm_delta,
                 'calls': {k: calls[k] for k in strikes if k in calls},
                 'puts': {k: puts[k] for k in strikes if k in puts}
             }
@@ -171,67 +170,72 @@ class DeltaExchangeClient:
         step = 1000 if underlying == 'BTC' else 100
         return round(price / step) * step
 
-    def get_strike_range(self, atm, underlying, count=5):
+    def get_strike_range(self, atm, underlying, count=15):
         step = 1000 if underlying == 'BTC' else 100
         return [atm + (i * step) for i in range(-count, count + 1)]
 
-# ==================== FORMATTER (USD STYLE) ====================
+# ==================== COMPACT FORMATTER ====================
 class TelegramFormatter:
     @staticmethod
-    def num_fmt(num):
-        """Format number to K or M (USD Style)"""
-        if num >= 1000000: return f"${num/1000000:.1f}M"
-        if num >= 1000: return f"${num/1000:.0f}K"
-        return f"${num:.0f}" # Small amounts
-
-    @staticmethod
-    def oi_fmt(num):
-        """Format OI (Quantity)"""
-        if num >= 1000000: return f"{num/1000000:.1f}M"
-        if num >= 1000: return f"{num/1000:.0f}K"
+    def compact_num(num):
+        """Super compact for 31 rows"""
+        if num >= 1000000: return f"{num/1000000:.1f}m" # 1.2m
+        if num >= 1000: return f"{num/1000:.0f}k"       # 50k
         return f"{num:.0f}"
 
     def generate_message(self, data):
         if not data: return None
         
-        u, spot, atm, exp = data['u'], data['spot'], data['atm'], data['exp']
-        calls, puts = data['calls'], data['puts']
+        u, spot, atm = data['u'], data['spot'], data['atm']
+        pcr = data['pcr']
+        
+        trend = "Neutral ⚖️"
+        if pcr > 1.0: trend = "Bullish 🟢"
+        elif pcr < 0.65: trend = "Bearish 🔴"
 
-        msg = f"🔔 <b>{u} CHAIN (Vol in $)</b>\n"
-        msg += f"🎯 Spot: <b>{spot:,.0f}</b> | ATM: <b>{atm:,.0f}</b>\n"
-        msg += f"📅 Exp: <b>{exp}</b>\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━\n"
-        msg += "<b>  CALLS ($Vol)     |   PUTS ($Vol)</b>\n"
-        msg += "<code> Vol    OI  LTP | LTP  OI    Vol </code>\n"
-        msg += "━━━━━━━━━━━━━━━━━━━━━\n"
+        # Header
+        msg = f"📊 <b>{u} DEEP CHAIN (31 Strikes)</b>\n"
+        msg += f"🎯 Spot: <b>{spot:,.0f}</b> | Delta: <b>{data['atm_delta']:.2f}</b>\n"
+        msg += f"⚖️ PCR: <b>{pcr:.2f}</b> ({trend})\n"
+        msg += f"📅 Exp: <b>{data['exp']}</b>\n"
+        msg += "─" * 30 + "\n"
+        
+        # Table Header (Tight Fit)
+        # C-Vol C-OI IV | IV P-OI P-Vol
+        msg += "<b> CALLS (Vol/OI/IV) | PUTS (IV/OI/Vol)</b>\n"
+        msg += "<code> Vol  OI IV | IV OI  Vol </code>\n"
+        msg += "─" * 30 + "\n"
 
-        strikes = sorted(set(list(calls.keys()) + list(puts.keys())))
+        strikes = sorted(set(list(data['calls'].keys()) + list(data['puts'].keys())))
         
         for k in strikes:
-            c = calls.get(k, {})
-            p = puts.get(k, {})
+            c = data['calls'].get(k, {})
+            p = data['puts'].get(k, {})
             
-            # Calls: Vol(USD), OI(Qty), LTP
-            c_v = self.num_fmt(c.get('volume', 0))
-            c_o = self.oi_fmt(c.get('oi', 0))
-            c_l = f"{c.get('ltp',0):.0f}" if c.get('ltp') else "-"
+            # Calls
+            cv = self.compact_num(c.get('vol', 0))
+            co = self.compact_num(c.get('oi', 0))
+            ci = f"{int(c.get('iv', 0))}" if c.get('iv') else "-"
             
-            # Puts: LTP, OI(Qty), Vol(USD)
-            p_l = f"{p.get('ltp',0):.0f}" if p.get('ltp') else "-"
-            p_o = self.oi_fmt(p.get('oi', 0))
-            p_v = self.num_fmt(p.get('volume', 0))
+            # Puts
+            pi = f"{int(p.get('iv', 0))}" if p.get('iv') else "-"
+            po = self.compact_num(p.get('oi', 0))
+            pv = self.compact_num(p.get('vol', 0))
 
-            marker = "🔹" if k == atm else "  "
-            strike_lbl = f"{k/1000:.1f}k" if u == 'BTC' else f"{k:.0f}"
-
-            # Compact Row
-            # Vol needs more space now ($1.2M)
-            row = f"{c_v:>5} {c_o:>3} {c_l:>4}|{p_l:<4} {p_o:<3} {p_v:<5}"
+            # Marker
+            marker = "🔹" if k == atm else " "
             
-            msg += f"<code>{row}</code> {marker}<b>{strike_lbl}</b>\n"
+            # Strike Format (Compact: 90k instead of 90000)
+            st_lbl = f"{k/1000:.0f}k" if u == 'BTC' else f"{k:.0f}"
 
-        msg += "━━━━━━━━━━━━━━━━━━━━━\n"
-        msg += "<i>$Vol = USD Value (Turnover)</i>"
+            # Row: Vol OI IV | IV OI Vol  [Strike]
+            # Designed to fit mobile screen
+            row = f"{cv:>4} {co:>3} {ci:>2}|{pi:<2} {po:<3} {pv:<4}"
+            
+            msg += f"<code>{row}</code>{marker}<b>{st_lbl}</b>\n"
+
+        msg += "─" * 30 + "\n"
+        msg += "<i>Vol in USD ($) | IV in %</i>"
         return msg
 
 # ==================== RUNNER ====================
@@ -243,35 +247,33 @@ async def main():
     client = DeltaExchangeClient()
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     fmt = TelegramFormatter()
-
-    logger.info("🚀 Bot Started (USD Vol Fix)...")
     
-    # Initial fetch
     client.get_products()
+    logger.info("🚀 Deep Analysis Bot Started...")
     
     while True:
         try:
-            # BTC
-            data = client.get_option_chain_data('BTC')
+            # BTC Only (Huge message, so limiting to BTC usually better)
+            data = client.get_analysis_data('BTC')
             if data:
                 await bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID, 
                     text=fmt.generate_message(data), 
                     parse_mode='HTML'
                 )
-                logger.info("✅ BTC Sent")
+                logger.info("✅ BTC Deep Data Sent")
             
             await asyncio.sleep(5)
 
             # ETH
-            data = client.get_option_chain_data('ETH')
+            data = client.get_analysis_data('ETH')
             if data:
                 await bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID, 
                     text=fmt.generate_message(data), 
                     parse_mode='HTML'
                 )
-                logger.info("✅ ETH Sent")
+                logger.info("✅ ETH Deep Data Sent")
 
         except Exception as e:
             logger.error(f"⚠️ Error: {e}")
